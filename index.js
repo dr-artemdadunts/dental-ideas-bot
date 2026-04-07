@@ -6,7 +6,6 @@ const { Client } = require('@notionhq/client');
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  signatureVerification: false, // TEMP: disabled for debug
   customRoutes: [
     {
       path: '/ping',
@@ -70,6 +69,8 @@ async function upsertProfile(slackId, userName, fields) {
 }
 
 async function saveIdea(idea, authorName) {
+  const scriptText = idea.script || '';
+  const whyText = idea.why || '';
   await notion.pages.create({
     parent: { database_id: process.env.NOTION_IDEAS_DB_ID },
     properties: {
@@ -79,8 +80,20 @@ async function saveIdea(idea, authorName) {
       'Источник': { select: { name: idea.source } },
       'Статус': { select: { name: '💡 Идея' } },
       'Хук': { rich_text: [{ text: { content: idea.hook || '' } }] },
-      'Почему зайдёт': { rich_text: [{ text: { content: idea.why || '' } }] },
+      'Почему зайдёт': { rich_text: [{ text: { content: whyText } }] },
     },
+    children: scriptText ? [
+      {
+        object: 'block',
+        type: 'heading_3',
+        heading_3: { rich_text: [{ type: 'text', text: { content: 'Сценарий' } }] },
+      },
+      {
+        object: 'block',
+        type: 'paragraph',
+        paragraph: { rich_text: [{ type: 'text', text: { content: scriptText } }] },
+      },
+    ] : [],
   });
 }
 
@@ -111,28 +124,63 @@ async function tavilySearch(query) {
 async function generateIdeas({ count, focus, profile, userName }) {
   const spec = profile?.specialization || '🦷 Терапия, 🪥 Гигиена';
   const voiceInfo = profile ? `
-Как говорит: ${profile.voice || 'не указано'}
-Чего избегает: ${profile.avoid || 'не указано'}
-Что заходит: ${profile.works || 'не указано'}
-Не делает в кадре: ${profile.notOnCamera || 'не указано'}` : '';
+Голос врача:
+- Как говорит: ${profile.voice || 'не указано'}
+- Чего избегает: ${profile.avoid || 'не указано'}
+- Что заходит у аудитории: ${profile.works || 'не указано'}
+- Не делает в кадре: ${profile.notOnCamera || 'не указано'}` : '';
 
-  const prompt = `Ты контент-стратег для стоматолога в СНГ. Сгенерируй ровно ${count} идей для соцсетей.
+  const prompt = `Ты — опытный контент-продюсер и сценарист для медицинских экспертов в Instagram/TikTok. Ты работаешь с врачом-стоматологом и создаёшь контент, который реально набирает просмотры и строит доверие пациентов.
 
-Врач: ${profile?.name || userName}
+ПРОФИЛЬ ВРАЧА:
+Имя: ${profile?.name || userName}
 Специализация: ${spec}${voiceInfo}
-${focus ? `Фокус недели: ${focus}` : ''}
+${focus ? `Фокус этой недели: ${focus}` : ''}
 
-СТРОГИЕ ПРАВИЛА:
-- Только темы по специализации врача
-- Только СНГ-аудитория, реалии СНГ
-- БЕЗ тем про цены и стоимость лечения
-- БЕЗ американских трендов
-- Источник выбирай из: "💬 Вопрос пациента", "🔥 Тренд", "🕵️ Конкурент", "🔬 PubMed", "💡 Своя идея"
-- Формат выбирай из: "🎬 Reels 30 сек", "🎬 Reels 60 сек", "🎠 Карусель", "📝 Пост", "🔬 Научная ветка"
+ЗАДАЧА: Сгенерируй ровно ${count} готовых контент-идей.
 
-Используй web_search для поиска актуальных трендов.
-Верни ТОЛЬКО валидный JSON массив без markdown:
-[{"topic":"...","format":"...","source":"...","hook":"...","why":"..."}]`;
+ОБЯЗАТЕЛЬНЫЕ ШАГИ ПЕРЕД ГЕНЕРАЦИЕЙ:
+1. Используй web_search чтобы найти актуальные вопросы пациентов на форумах и в комментариях (запрос: "${spec} вопросы пациентов форум 2024 2025")
+2. Используй web_search чтобы найти что сейчас вирусится у стоматологов в СНГ (запрос: "стоматолог instagram reels тренды СНГ")
+3. Используй web_search для поиска свежих исследований по специализации врача
+
+ТРЕБОВАНИЯ К КАЖДОЙ ИДЕЕ:
+- Конкретная, не абстрактная — не "про кариес", а "почему кариес появляется снова через год после лечения"
+- Хук — первые 3 секунды видео или первое предложение поста, должен остановить скролл. Используй формулы: страх/ошибка/факт-шок/вопрос-провокация/личная история
+- Сценарий — конкретные 3-5 тезиса что говорить, не общие слова
+- Угол — неочевидный взгляд на тему, который отличает этого врача от других
+- Эмоция — какую эмоцию вызывает у пациента: страх→облегчение, стыд→принятие, незнание→озарение
+
+ФОРМАТЫ (выбирай исходя из темы):
+- "🎬 Reels 30 сек" — один факт/ответ на вопрос, быстро и чётко
+- "🎬 Reels 60 сек" — мини-история или разбор мифа с примером
+- "🎠 Карусель" — пошаговые инструкции, сравнения, списки
+- "📝 Пост" — личная история, кейс пациента, экспертное мнение
+- "🔬 Научная ветка" — разбор исследования простым языком
+
+ИСТОЧНИКИ:
+- "💬 Вопрос пациента" — реальный вопрос который задают на приёме или в интернете
+- "🔥 Тренд" — тема которая сейчас актуальна в соцсетях или новостях
+- "🕵️ Конкурент" — тема которую делают другие, но можно сделать лучше/глубже
+- "🔬 PubMed" — свежее исследование переведённое на человеческий язык
+- "💡 Своя идея" — уникальный опыт или наблюдение врача
+
+СТРОГИЕ ОГРАНИЧЕНИЯ:
+- Только темы строго по специализации врача
+- Только СНГ-контекст: реалии, менталитет, страхи пациентов из России/Украины/Казахстана
+- БЕЗ тем про цены и стоимость
+- БЕЗ западных трендов без адаптации под СНГ
+- Хук должен быть написан готовым текстом, не описанием
+
+Верни ТОЛЬКО валидный JSON массив без markdown и пояснений:
+[{
+  "topic": "точная формулировка темы",
+  "format": "один из форматов выше",
+  "source": "один из источников выше",
+  "hook": "готовый текст хука — первые слова видео или поста",
+  "why": "почему зайдёт: какую боль/страх/интерес задевает",
+  "script": "3-5 конкретных тезисов через • что говорить в этом контенте"
+}]`;
 
   let messages = [{ role: 'user', content: prompt }];
   let response = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, tools, messages });
@@ -237,7 +285,7 @@ app.view('ideas_modal', async ({ ack, view, client }) => {
 
     const notionUrl = `https://www.notion.so/${process.env.NOTION_IDEAS_DB_ID.replace(/-/g, '')}`;
     const lines = ideas.map((idea, i) =>
-      `*${i + 1}. ${idea.topic}*\n${idea.format} · ${idea.source}\n_${idea.hook}_`
+      `*${i + 1}. ${idea.topic}*\n${idea.format} · ${idea.source}\n> ${idea.hook}\n_${idea.script || idea.why}_`
     ).join('\n\n');
 
     await client.chat.postMessage({
