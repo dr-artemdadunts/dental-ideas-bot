@@ -320,18 +320,15 @@ app.command('/profile', async ({ command, ack, client }) => {
             action_id: 'specialization',
             initial_options: existing?.specialization
               ? existing.specialization.split(', ').map(s => ({ text: { type: 'plain_text', text: s }, value: s })).filter(o =>
-                  ['Терапия', 'Гигиена', 'Хирургия', 'Ортодонтия', 'Педиатрия', 'Имплантология', 'Ортопедия', 'Пародонтология'].includes(o.value)
+                  ['🦷 Терапия', '🪥 Гигиена', '🦴 Ортопедия', '🔬 Пародонтология', '😁 Эстетика'].includes(o.value)
                 )
               : undefined,
             options: [
-              { text: { type: 'plain_text', text: 'Терапия' }, value: 'Терапия' },
-              { text: { type: 'plain_text', text: 'Гигиена' }, value: 'Гигиена' },
-              { text: { type: 'plain_text', text: 'Хирургия' }, value: 'Хирургия' },
-              { text: { type: 'plain_text', text: 'Ортодонтия' }, value: 'Ортодонтия' },
-              { text: { type: 'plain_text', text: 'Педиатрия' }, value: 'Педиатрия' },
-              { text: { type: 'plain_text', text: 'Имплантология' }, value: 'Имплантология' },
-              { text: { type: 'plain_text', text: 'Ортопедия' }, value: 'Ортопедия' },
-              { text: { type: 'plain_text', text: 'Пародонтология' }, value: 'Пародонтология' },
+              { text: { type: 'plain_text', text: '🦷 Терапия' }, value: '🦷 Терапия' },
+              { text: { type: 'plain_text', text: '🪥 Гигиена' }, value: '🪥 Гигиена' },
+              { text: { type: 'plain_text', text: '🦴 Ортопедия' }, value: '🦴 Ортопедия' },
+              { text: { type: 'plain_text', text: '🔬 Пародонтология' }, value: '🔬 Пародонтология' },
+              { text: { type: 'plain_text', text: '😁 Эстетика' }, value: '😁 Эстетика' },
             ],
           },
         },
