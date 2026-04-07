@@ -1,42 +1,23 @@
 require('dotenv').config();
-const express = require('express');
-const { App, ExpressReceiver } = require('@slack/bolt');
+const { App } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk');
 const { Client } = require('@notionhq/client');
 
-// ── Express + Bolt setup ─────────────────────────────────────────────────────
-
-const expressApp = express();
-
-expressApp.get('/ping', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
-expressApp.use('/slack/events', express.raw({ type: '*/*' }), (req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} /slack/events content-type:`, req.headers['content-type']);
-  const raw = req.body;
-  req.rawBody = raw;
-  const contentType = req.headers['content-type'] || '';
-
-  if (contentType.includes('application/json')) {
-    try {
-      const parsed = JSON.parse(raw.toString());
-      req.body = parsed;
-      if (parsed.type === 'url_verification') return res.json({ challenge: parsed.challenge });
-    } catch (e) {}
-  } else if (contentType.includes('application/x-www-form-urlencoded')) {
-    const params = new URLSearchParams(raw.toString());
-    req.body = Object.fromEntries(params.entries());
-  }
-
-  next();
-});
-
-const receiver = new ExpressReceiver({
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
-  signatureVerification: false,
-  app: expressApp,
+  customRoutes: [
+    {
+      path: '/ping',
+      method: ['GET'],
+      handler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      },
+    },
+  ],
 });
 
-const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 
@@ -102,15 +83,15 @@ async function saveIdea(idea, authorName) {
   });
 }
 
-// ── Claude ────────────────────────────────────────────────────────────────────
+// ── Claude + Tavily ───────────────────────────────────────────────────────────
 
 const tools = [
   {
     name: 'web_search',
-    description: 'Search the internet for current dental trends, patient questions, and content ideas. Use for finding trending topics, recent studies, or competitor content.',
+    description: 'Search the internet for current dental trends, patient questions, and content ideas.',
     input_schema: {
       type: 'object',
-      properties: { query: { type: 'string', description: 'Search query in Russian or English' } },
+      properties: { query: { type: 'string' } },
       required: ['query'],
     },
   },
@@ -127,7 +108,7 @@ async function tavilySearch(query) {
 }
 
 async function generateIdeas({ count, focus, profile, userName }) {
-  const spec = profile?.specialization || 'Терапия, Гигиена';
+  const spec = profile?.specialization || '🦷 Терапия, 🪥 Гигиена';
   const voiceInfo = profile ? `
 Как говорит: ${profile.voice || 'не указано'}
 Чего избегает: ${profile.avoid || 'не указано'}
@@ -141,26 +122,19 @@ async function generateIdeas({ count, focus, profile, userName }) {
 ${focus ? `Фокус недели: ${focus}` : ''}
 
 СТРОГИЕ ПРАВИЛА:
-- Только темы по специализации врача (${spec})
+- Только темы по специализации врача
 - Только СНГ-аудитория, реалии СНГ
-- БЕЗ хирургии, ортодонтии, педиатрии (если не в специализации)
 - БЕЗ тем про цены и стоимость лечения
-- БЕЗ американских трендов и исследований
+- БЕЗ американских трендов
 - Источник выбирай из: "💬 Вопрос пациента", "🔥 Тренд", "🕵️ Конкурент", "🔬 PubMed", "💡 Своя идея"
 - Формат выбирай из: "🎬 Reels 30 сек", "🎬 Reels 60 сек", "🎠 Карусель", "📝 Пост", "🔬 Научная ветка"
 
-Используй web_search для поиска актуальных трендов и вопросов пациентов перед генерацией.
-
-Верни ТОЛЬКО валидный JSON массив без markdown блоков:
+Используй web_search для поиска актуальных трендов.
+Верни ТОЛЬКО валидный JSON массив без markdown:
 [{"topic":"...","format":"...","source":"...","hook":"...","why":"..."}]`;
 
   let messages = [{ role: 'user', content: prompt }];
-  let response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 4000,
-    tools,
-    messages,
-  });
+  let response = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, tools, messages });
 
   while (response.stop_reason === 'tool_use') {
     const toolUse = response.content.find(b => b.type === 'tool_use');
@@ -174,38 +148,24 @@ ${focus ? `Фокус недели: ${focus}` : ''}
       { role: 'assistant', content: response.content },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult }] },
     ];
-    response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      tools,
-      messages,
-    });
+    response = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, tools, messages });
   }
 
   const text = response.content.find(b => b.type === 'text')?.text || '[]';
   try {
     return JSON.parse(text);
   } catch (e) {
-    // Повтор при невалидном JSON
-    console.error('JSON parse error, retrying:', text.slice(0, 200));
-    messages = [
-      ...messages,
-      { role: 'assistant', content: response.content },
-      { role: 'user', content: 'Ответ не является валидным JSON. Верни ТОЛЬКО JSON массив, без пояснений и markdown.' },
-    ];
-    const retry = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4000,
-      messages,
-    });
+    console.error('JSON parse error, retrying');
+    messages = [...messages, { role: 'assistant', content: response.content }, { role: 'user', content: 'Верни ТОЛЬКО JSON массив без пояснений и markdown.' }];
+    const retry = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages });
     return JSON.parse(retry.content.find(b => b.type === 'text')?.text || '[]');
   }
 }
 
-// ── /ideas command ────────────────────────────────────────────────────────────
+// ── /ideas ────────────────────────────────────────────────────────────────────
 
 app.command('/ideas', async ({ command, ack, client }) => {
-  console.log('[/ideas] received from', command.user_id, 'trigger_id:', command.trigger_id?.slice(0, 20));
+  console.log('[/ideas] received, trigger_id:', command.trigger_id?.slice(0, 20));
   await ack();
   console.log('[/ideas] ack sent');
   try {
@@ -249,39 +209,31 @@ app.command('/ideas', async ({ command, ack, client }) => {
         ],
       },
     });
-    console.log('[/ideas] modal opened successfully');
+    console.log('[/ideas] modal opened');
   } catch (err) {
-    console.error('[/ideas] views.open error:', err.message, err.data);
+    console.error('[/ideas] error:', err.message, JSON.stringify(err.data));
   }
 });
 
 app.view('ideas_modal', async ({ ack, view, client }) => {
   await ack();
-
   const meta = JSON.parse(view.private_metadata);
   const { channel, user_id, user_name } = meta;
   const count = parseInt(view.state.values.count_block.count.selected_option.value, 10);
   const focus = view.state.values.focus_block.focus.value || '';
 
-  // Ответить в канале "генерирую..."
-  await client.chat.postMessage({
-    channel,
-    text: `⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...`,
-  });
+  await client.chat.postMessage({ channel, text: `⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...` });
 
   try {
     const profile = await getProfile(user_id);
-    const defaultProfile = profile || { name: user_name, specialization: 'Терапия, Гигиена' };
-
+    const defaultProfile = profile || { name: user_name, specialization: '🦷 Терапия, 🪥 Гигиена' };
     const ideas = await generateIdeas({ count, focus, profile: defaultProfile, userName: user_name });
 
-    // Сохранить в Notion
     for (const idea of ideas) {
       try { await saveIdea(idea, defaultProfile.name || user_name); }
       catch (e) { console.error('Notion saveIdea error:', e.message); }
     }
 
-    // Сформировать ответ
     const notionUrl = `https://www.notion.so/${process.env.NOTION_IDEAS_DB_ID.replace(/-/g, '')}`;
     const lines = ideas.map((idea, i) =>
       `*${i + 1}. ${idea.topic}*\n${idea.format} · ${idea.source}\n_${idea.hook}_`
@@ -291,148 +243,99 @@ app.view('ideas_modal', async ({ ack, view, client }) => {
       channel,
       blocks: [
         { type: 'section', text: { type: 'mrkdwn', text: `✅ Готово! ${ideas.length} идей для *${defaultProfile.name || user_name}*:\n\n${lines}` } },
-        {
-          type: 'actions',
-          elements: [{
-            type: 'button',
-            text: { type: 'plain_text', text: '📋 Открыть в Notion' },
-            url: notionUrl,
-            style: 'primary',
-          }],
-        },
+        { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '📋 Открыть в Notion' }, url: notionUrl, style: 'primary' }] },
       ],
       text: `Готово! ${ideas.length} идей сгенерировано.`,
     });
-
   } catch (err) {
     console.error('ideas_modal error:', err);
-    await client.chat.postMessage({
-      channel,
-      text: `❌ Ошибка при генерации: ${err.message}`,
-    });
+    await client.chat.postMessage({ channel, text: `❌ Ошибка: ${err.message}` });
   }
 });
 
-// ── /profile command ──────────────────────────────────────────────────────────
+// ── /profile ──────────────────────────────────────────────────────────────────
 
 app.command('/profile', async ({ command, ack, client }) => {
   await ack();
-
   const existing = await getProfile(command.user_id);
-
-  await client.views.open({
-    trigger_id: command.trigger_id,
-    view: {
-      type: 'modal',
-      callback_id: 'profile_modal',
-      private_metadata: JSON.stringify({ user_id: command.user_id, user_name: command.user_name, channel: command.channel_id }),
-      title: { type: 'plain_text', text: '👤 Мой профиль' },
-      submit: { type: 'plain_text', text: 'Сохранить' },
-      close: { type: 'plain_text', text: 'Отмена' },
-      blocks: [
-        {
-          type: 'input',
-          block_id: 'spec_block',
-          label: { type: 'plain_text', text: 'Специализация' },
-          element: {
-            type: 'checkboxes',
-            action_id: 'specialization',
-            initial_options: existing?.specialization
-              ? existing.specialization.split(', ').map(s => ({ text: { type: 'plain_text', text: s }, value: s })).filter(o =>
-                  ['🦷 Терапия', '🪥 Гигиена', '🦴 Ортопедия', '🔬 Пародонтология', '😁 Эстетика'].includes(o.value)
-                )
-              : undefined,
-            options: [
-              { text: { type: 'plain_text', text: '🦷 Терапия' }, value: '🦷 Терапия' },
-              { text: { type: 'plain_text', text: '🪥 Гигиена' }, value: '🪥 Гигиена' },
-              { text: { type: 'plain_text', text: '🦴 Ортопедия' }, value: '🦴 Ортопедия' },
-              { text: { type: 'plain_text', text: '🔬 Пародонтология' }, value: '🔬 Пародонтология' },
-              { text: { type: 'plain_text', text: '😁 Эстетика' }, value: '😁 Эстетика' },
-            ],
+  try {
+    await client.views.open({
+      trigger_id: command.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: 'profile_modal',
+        private_metadata: JSON.stringify({ user_id: command.user_id, user_name: command.user_name, channel: command.channel_id }),
+        title: { type: 'plain_text', text: '👤 Мой профиль' },
+        submit: { type: 'plain_text', text: 'Сохранить' },
+        close: { type: 'plain_text', text: 'Отмена' },
+        blocks: [
+          {
+            type: 'input',
+            block_id: 'spec_block',
+            label: { type: 'plain_text', text: 'Специализация' },
+            element: {
+              type: 'checkboxes',
+              action_id: 'specialization',
+              initial_options: existing?.specialization
+                ? existing.specialization.split(', ').map(s => ({ text: { type: 'plain_text', text: s }, value: s }))
+                    .filter(o => ['🦷 Терапия', '🪥 Гигиена', '🦴 Ортопедия', '🔬 Пародонтология', '😁 Эстетика'].includes(o.value))
+                : undefined,
+              options: [
+                { text: { type: 'plain_text', text: '🦷 Терапия' }, value: '🦷 Терапия' },
+                { text: { type: 'plain_text', text: '🪥 Гигиена' }, value: '🪥 Гигиена' },
+                { text: { type: 'plain_text', text: '🦴 Ортопедия' }, value: '🦴 Ортопедия' },
+                { text: { type: 'plain_text', text: '🔬 Пародонтология' }, value: '🔬 Пародонтология' },
+                { text: { type: 'plain_text', text: '😁 Эстетика' }, value: '😁 Эстетика' },
+              ],
+            },
           },
-        },
-        {
-          type: 'input',
-          block_id: 'voice_block',
-          optional: true,
-          label: { type: 'plain_text', text: 'Как я говорю' },
-          element: {
-            type: 'plain_text_input',
-            action_id: 'voice',
-            initial_value: existing?.voice || '',
-            placeholder: { type: 'plain_text', text: 'Просто, без сложных терминов, с примерами из жизни' },
-            multiline: true,
+          {
+            type: 'input', block_id: 'voice_block', optional: true,
+            label: { type: 'plain_text', text: 'Как я говорю' },
+            element: { type: 'plain_text_input', action_id: 'voice', initial_value: existing?.voice || '', placeholder: { type: 'plain_text', text: 'Просто, без сложных терминов' }, multiline: true },
           },
-        },
-        {
-          type: 'input',
-          block_id: 'avoid_block',
-          optional: true,
-          label: { type: 'plain_text', text: 'Чего избегаю' },
-          element: {
-            type: 'plain_text_input',
-            action_id: 'avoid',
-            initial_value: existing?.avoid || '',
-            placeholder: { type: 'plain_text', text: 'Пугать пациентов, говорить про боль' },
-            multiline: true,
+          {
+            type: 'input', block_id: 'avoid_block', optional: true,
+            label: { type: 'plain_text', text: 'Чего избегаю' },
+            element: { type: 'plain_text_input', action_id: 'avoid', initial_value: existing?.avoid || '', placeholder: { type: 'plain_text', text: 'Пугать пациентов' }, multiline: true },
           },
-        },
-        {
-          type: 'input',
-          block_id: 'works_block',
-          optional: true,
-          label: { type: 'plain_text', text: 'Что заходит у аудитории' },
-          element: {
-            type: 'plain_text_input',
-            action_id: 'works',
-            initial_value: existing?.works || '',
-            placeholder: { type: 'plain_text', text: 'До/после, развенчание мифов, ответы на вопросы' },
-            multiline: true,
+          {
+            type: 'input', block_id: 'works_block', optional: true,
+            label: { type: 'plain_text', text: 'Что заходит у аудитории' },
+            element: { type: 'plain_text_input', action_id: 'works', initial_value: existing?.works || '', placeholder: { type: 'plain_text', text: 'До/после, развенчание мифов' }, multiline: true },
           },
-        },
-        {
-          type: 'input',
-          block_id: 'notoncamera_block',
-          optional: true,
-          label: { type: 'plain_text', text: 'Не делаю в кадре' },
-          element: {
-            type: 'plain_text_input',
-            action_id: 'notOnCamera',
-            initial_value: existing?.notOnCamera || '',
-            placeholder: { type: 'plain_text', text: 'Танцы, тренды с музыкой' },
-            multiline: true,
+          {
+            type: 'input', block_id: 'notoncamera_block', optional: true,
+            label: { type: 'plain_text', text: 'Не делаю в кадре' },
+            element: { type: 'plain_text_input', action_id: 'notOnCamera', initial_value: existing?.notOnCamera || '', placeholder: { type: 'plain_text', text: 'Танцы, тренды с музыкой' }, multiline: true },
           },
-        },
-      ],
-    },
-  });
+        ],
+      },
+    });
+  } catch (err) {
+    console.error('[/profile] error:', err.message);
+  }
 });
 
 app.view('profile_modal', async ({ ack, view, client }) => {
   await ack();
-
   const meta = JSON.parse(view.private_metadata);
   const { user_id, user_name, channel } = meta;
   const vals = view.state.values;
-
   const specialization = (vals.spec_block.specialization.selected_options || []).map(o => o.value);
-  const voice = vals.voice_block.voice.value || '';
-  const avoid = vals.avoid_block.avoid.value || '';
-  const works = vals.works_block.works.value || '';
-  const notOnCamera = vals.notoncamera_block.notOnCamera.value || '';
 
   try {
-    await upsertProfile(user_id, user_name, { specialization, voice, avoid, works, notOnCamera });
-    await client.chat.postMessage({
-      channel,
-      text: `✅ Профиль обновлён, <@${user_id}>!`,
+    await upsertProfile(user_id, user_name, {
+      specialization,
+      voice: vals.voice_block.voice.value || '',
+      avoid: vals.avoid_block.avoid.value || '',
+      works: vals.works_block.works.value || '',
+      notOnCamera: vals.notoncamera_block.notOnCamera.value || '',
     });
+    await client.chat.postMessage({ channel, text: `✅ Профиль обновлён, <@${user_id}>!` });
   } catch (err) {
     console.error('profile_modal error:', err);
-    await client.chat.postMessage({
-      channel,
-      text: `❌ Ошибка при сохранении профиля: ${err.message}`,
-    });
+    await client.chat.postMessage({ channel, text: `❌ Ошибка: ${err.message}` });
   }
 });
 
