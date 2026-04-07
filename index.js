@@ -30,6 +30,7 @@ expressApp.use('/slack/events', express.raw({ type: '*/*' }), (req, res, next) =
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET,
+  signatureVerification: false,
   app: expressApp,
 });
 
