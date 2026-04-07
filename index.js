@@ -8,6 +8,8 @@ const { Client } = require('@notionhq/client');
 
 const expressApp = express();
 
+expressApp.get('/ping', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
 expressApp.use('/slack/events', express.raw({ type: '*/*' }), (req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} /slack/events content-type:`, req.headers['content-type']);
   const raw = req.body;
