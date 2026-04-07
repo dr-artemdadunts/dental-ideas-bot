@@ -337,6 +337,17 @@ app.command('/profile', async ({ command, ack, client }) => {
         blocks: [
           {
             type: 'input',
+            block_id: 'name_block',
+            label: { type: 'plain_text', text: 'Имя (как отображать в Банке идей)' },
+            element: {
+              type: 'plain_text_input',
+              action_id: 'name',
+              initial_value: existing?.name || '',
+              placeholder: { type: 'plain_text', text: 'Например: Артём' },
+            },
+          },
+          {
+            type: 'input',
             block_id: 'spec_block',
             label: { type: 'plain_text', text: 'Специализация' },
             element: {
@@ -388,10 +399,12 @@ app.view('profile_modal', async ({ ack, view, client }) => {
   const meta = JSON.parse(view.private_metadata);
   const { user_id, user_name, channel } = meta;
   const vals = view.state.values;
+  const nameVal = vals.name_block.name.value || user_name;
   const specialization = (vals.spec_block.specialization.selected_options || []).map(o => o.value);
 
   try {
     await upsertProfile(user_id, user_name, {
+      name: nameVal,
       specialization,
       voice: vals.voice_block.voice.value || '',
       avoid: vals.avoid_block.avoid.value || '',
