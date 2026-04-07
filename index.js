@@ -6,6 +6,7 @@ const { Client } = require('@notionhq/client');
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
+  signatureVerification: false, // TEMP: disabled for debug
   customRoutes: [
     {
       path: '/ping',
