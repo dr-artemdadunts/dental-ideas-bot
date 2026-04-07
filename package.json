@@ -1,0 +1,15 @@
+{
+  "name": "dental-ideas-bot",
+  "version": "1.0.0",
+  "description": "Slack-бот для генерации контент-идей стоматологов",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@notionhq/client": "^2.2.15",
+    "@slack/bolt": "^3.21.1",
+    "dotenv": "^16.4.7"
+  }
+}
