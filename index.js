@@ -11,11 +11,19 @@ const expressApp = express();
 expressApp.use('/slack/events', express.raw({ type: '*/*' }), (req, res, next) => {
   const raw = req.body;
   req.rawBody = raw;
-  try {
-    const parsed = JSON.parse(raw.toString());
-    req.body = parsed;
-    if (parsed.type === 'url_verification') return res.json({ challenge: parsed.challenge });
-  } catch (e) {}
+  const contentType = req.headers['content-type'] || '';
+
+  if (contentType.includes('application/json')) {
+    try {
+      const parsed = JSON.parse(raw.toString());
+      req.body = parsed;
+      if (parsed.type === 'url_verification') return res.json({ challenge: parsed.challenge });
+    } catch (e) {}
+  } else if (contentType.includes('application/x-www-form-urlencoded')) {
+    const params = new URLSearchParams(raw.toString());
+    req.body = Object.fromEntries(params.entries());
+  }
+
   next();
 });
 
