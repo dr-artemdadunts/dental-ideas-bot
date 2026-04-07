@@ -284,15 +284,32 @@ app.view('ideas_modal', async ({ ack, view, client }) => {
     }
 
     const notionUrl = `https://www.notion.so/${process.env.NOTION_IDEAS_DB_ID.replace(/-/g, '')}`;
-    const lines = ideas.map((idea, i) =>
-      `*${i + 1}. ${idea.topic}*\n${idea.format} · ${idea.source}\n> ${idea.hook}\n_${idea.script || idea.why}_`
-    ).join('\n\n');
+
+    const ideaBlocks = ideas.flatMap((idea, i) => [
+      { type: 'divider' },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*${i + 1}. ${idea.topic}*\n${idea.format} · ${idea.source}\n\n💬 *Хук:* ${idea.hook}`,
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `📋 *Сценарий:*\n${(idea.script || idea.why || '').slice(0, 700)}`,
+        },
+      },
+    ]);
 
     await client.chat.postMessage({
       channel,
       blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: `✅ Готово! ${ideas.length} идей для *${defaultProfile.name || user_name}*:\n\n${lines}` } },
-        { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '📋 Открыть в Notion' }, url: notionUrl, style: 'primary' }] },
+        { type: 'section', text: { type: 'mrkdwn', text: `✅ *${ideas.length} идей для ${defaultProfile.name || user_name}*` } },
+        ...ideaBlocks,
+        { type: 'divider' },
+        { type: 'section', text: { type: 'mrkdwn', text: `<${notionUrl}|📋 Открыть все идеи в Notion>` } },
       ],
       text: `Готово! ${ideas.length} идей сгенерировано.`,
     });
