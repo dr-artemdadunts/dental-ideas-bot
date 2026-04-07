@@ -203,47 +203,54 @@ ${focus ? `Фокус недели: ${focus}` : ''}
 // ── /ideas command ────────────────────────────────────────────────────────────
 
 app.command('/ideas', async ({ command, ack, client }) => {
+  console.log('[/ideas] received from', command.user_id, 'trigger_id:', command.trigger_id?.slice(0, 20));
   await ack();
-  await client.views.open({
-    trigger_id: command.trigger_id,
-    view: {
-      type: 'modal',
-      callback_id: 'ideas_modal',
-      private_metadata: JSON.stringify({ channel: command.channel_id, user_id: command.user_id, user_name: command.user_name }),
-      title: { type: 'plain_text', text: '💡 Генерация идей' },
-      submit: { type: 'plain_text', text: 'Сгенерировать' },
-      close: { type: 'plain_text', text: 'Отмена' },
-      blocks: [
-        {
-          type: 'input',
-          block_id: 'count_block',
-          label: { type: 'plain_text', text: 'Количество идей' },
-          element: {
-            type: 'static_select',
-            action_id: 'count',
-            placeholder: { type: 'plain_text', text: 'Выбери количество' },
-            options: [
-              { text: { type: 'plain_text', text: '5 идей' }, value: '5' },
-              { text: { type: 'plain_text', text: '8 идей' }, value: '8' },
-              { text: { type: 'plain_text', text: '12 идей' }, value: '12' },
-            ],
+  console.log('[/ideas] ack sent');
+  try {
+    await client.views.open({
+      trigger_id: command.trigger_id,
+      view: {
+        type: 'modal',
+        callback_id: 'ideas_modal',
+        private_metadata: JSON.stringify({ channel: command.channel_id, user_id: command.user_id, user_name: command.user_name }),
+        title: { type: 'plain_text', text: '💡 Генерация идей' },
+        submit: { type: 'plain_text', text: 'Сгенерировать' },
+        close: { type: 'plain_text', text: 'Отмена' },
+        blocks: [
+          {
+            type: 'input',
+            block_id: 'count_block',
+            label: { type: 'plain_text', text: 'Количество идей' },
+            element: {
+              type: 'static_select',
+              action_id: 'count',
+              placeholder: { type: 'plain_text', text: 'Выбери количество' },
+              options: [
+                { text: { type: 'plain_text', text: '5 идей' }, value: '5' },
+                { text: { type: 'plain_text', text: '8 идей' }, value: '8' },
+                { text: { type: 'plain_text', text: '12 идей' }, value: '12' },
+              ],
+            },
           },
-        },
-        {
-          type: 'input',
-          block_id: 'focus_block',
-          optional: true,
-          label: { type: 'plain_text', text: 'Фокус недели (необязательно)' },
-          element: {
-            type: 'plain_text_input',
-            action_id: 'focus',
-            placeholder: { type: 'plain_text', text: 'Например: профилактика кариеса у взрослых' },
-            multiline: false,
+          {
+            type: 'input',
+            block_id: 'focus_block',
+            optional: true,
+            label: { type: 'plain_text', text: 'Фокус недели (необязательно)' },
+            element: {
+              type: 'plain_text_input',
+              action_id: 'focus',
+              placeholder: { type: 'plain_text', text: 'Например: профилактика кариеса у взрослых' },
+              multiline: false,
+            },
           },
-        },
-      ],
-    },
-  });
+        ],
+      },
+    });
+    console.log('[/ideas] modal opened successfully');
+  } catch (err) {
+    console.error('[/ideas] views.open error:', err.message, err.data);
+  }
 });
 
 app.view('ideas_modal', async ({ ack, view, client }) => {
