@@ -21,9 +21,12 @@ if (missingEnvVars.length > 0) {
   process.exit(1);
 }
 
+let botStarted = false;
 process.on('unhandledRejection', (reason) => {
-  console.error('❌ Бот упал из-за необработанной ошибки:', reason?.message || reason);
-  process.exit(1);
+  console.error('❌ Необработанная ошибка:', reason?.message || reason);
+  if (!botStarted) {
+    process.exit(1);
+  }
 });
 
 const app = new App({
@@ -287,14 +290,32 @@ app.command('/ideas', async ({ command, ack, client }) => {
   }
 });
 
-app.view('ideas_modal', async ({ ack, view, client }) => {
+app.view('ideas_modal', async ({ ack, view, client, body }) => {
+  console.log('[ideas_modal] view_submission received');
   await ack();
-  const meta = JSON.parse(view.private_metadata);
-  const { channel, user_id, user_name } = meta;
-  const count = parseInt(view.state.values.count_block.count.selected_option.value, 10);
-  const focus = view.state.values.focus_block.focus.value || '';
+  console.log('[ideas_modal] ack sent');
 
-  await client.chat.postMessage({ channel, text: `⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...` });
+  let channel, user_id, user_name, count, focus;
+  try {
+    const meta = JSON.parse(view.private_metadata);
+    channel = meta.channel;
+    user_id = meta.user_id;
+    user_name = meta.user_name;
+    count = parseInt(view.state.values.count_block.count.selected_option.value, 10);
+    focus = view.state.values.focus_block.focus.value || '';
+    console.log('[ideas_modal] parsed input:', { channel, user_id, count, focus });
+  } catch (err) {
+    console.error('[ideas_modal] failed to parse submission:', err);
+    return;
+  }
+
+  try {
+    await client.chat.postMessage({ channel, text: `⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...` });
+    console.log('[ideas_modal] "Генерирую" message sent');
+  } catch (err) {
+    console.error('[ideas_modal] failed to send "Генерирую" message:', err.message, JSON.stringify(err.data));
+    return;
+  }
 
   try {
     const profile = await getProfile(user_id);
@@ -447,6 +468,7 @@ app.view('profile_modal', async ({ ack, view, client }) => {
   const port = process.env.PORT || 3000;
   try {
     await app.start(port);
+    botStarted = true;
     console.log(`Бот запущен на порту ${port}`);
   } catch (err) {
     console.error('❌ Не удалось запустить бота:', err.message);
