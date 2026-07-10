@@ -3,6 +3,29 @@ const { App } = require('@slack/bolt');
 const Anthropic = require('@anthropic-ai/sdk');
 const { Client } = require('@notionhq/client');
 
+const REQUIRED_ENV_VARS = [
+  'SLACK_BOT_TOKEN',
+  'SLACK_SIGNING_SECRET',
+  'ANTHROPIC_API_KEY',
+  'NOTION_TOKEN',
+  'NOTION_IDEAS_DB_ID',
+  'NOTION_PROFILES_DB_ID',
+];
+
+const missingEnvVars = REQUIRED_ENV_VARS.filter(name => !process.env[name]);
+if (missingEnvVars.length > 0) {
+  console.error(
+    `❌ Бот не может запуститься: не заданы переменные окружения: ${missingEnvVars.join(', ')}.\n` +
+    'Проверь Railway → Variables и добавь недостающие значения, затем передеплой сервис.'
+  );
+  process.exit(1);
+}
+
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Бот упал из-за необработанной ошибки:', reason?.message || reason);
+  process.exit(1);
+});
+
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -422,6 +445,11 @@ app.view('profile_modal', async ({ ack, view, client }) => {
 
 (async () => {
   const port = process.env.PORT || 3000;
-  await app.start(port);
-  console.log(`Бот запущен на порту ${port}`);
+  try {
+    await app.start(port);
+    console.log(`Бот запущен на порту ${port}`);
+  } catch (err) {
+    console.error('❌ Не удалось запустить бота:', err.message);
+    process.exit(1);
+  }
 })();

@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Slack-бот для генерации контент-идей стоматологов",
   "main": "index.js",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "start": "node index.js"
   },
