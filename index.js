@@ -1,11 +1,25 @@
 require('dotenv').config();
-const { App } = require('@slack/bolt');
+const http = require('http');
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  EmbedBuilder,
+} = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
-const { Client } = require('@notionhq/client');
+const { Client: NotionClient } = require('@notionhq/client');
 
 const REQUIRED_ENV_VARS = [
-  'SLACK_BOT_TOKEN',
-  'SLACK_SIGNING_SECRET',
+  'DISCORD_BOT_TOKEN',
+  'DISCORD_CLIENT_ID',
+  'DISCORD_GUILD_ID',
   'ANTHROPIC_API_KEY',
   'NOTION_TOKEN',
   'NOTION_IDEAS_DB_ID',
@@ -29,31 +43,24 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-const app = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  customRoutes: [
-    {
-      path: '/ping',
-      method: ['GET'],
-      handler: (req, res) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-      },
-    },
-  ],
-});
-
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const notion = new Client({ auth: process.env.NOTION_TOKEN });
+// ID модели можно переопределить переменной окружения ANTHROPIC_MODEL в Railway —
+// это позволяет обновить модель без редеплоя кода, когда Anthropic ретайрит старую версию.
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
+const notion = new NotionClient({ auth: process.env.NOTION_TOKEN });
+
+const SPECIALIZATIONS = ['🦷 Терапия', '🪥 Гигиена', '🦴 Ортопедия', '🔬 Пародонтология', '😁 Эстетика'];
 
 // ── Notion helpers ────────────────────────────────────────────────────────────
+// Примечание: свойство в Notion по-прежнему называется "Slack ID" — это просто
+// текстовое поле для внешнего ID пользователя, теперь в нём хранится Discord ID.
+// Переименовать колонку в Notion можно в любой момент, на логику это не влияет.
 
-async function getProfile(slackId) {
+async function getProfile(discordId) {
   try {
     const res = await notion.databases.query({
       database_id: process.env.NOTION_PROFILES_DB_ID,
-      filter: { property: 'Slack ID', rich_text: { equals: slackId } },
+      filter: { property: 'Slack ID', rich_text: { equals: discordId } },
     });
     if (res.results.length === 0) return null;
     const page = res.results[0];
@@ -73,11 +80,11 @@ async function getProfile(slackId) {
   }
 }
 
-async function upsertProfile(slackId, userName, fields) {
-  const existing = await getProfile(slackId);
+async function upsertProfile(discordId, userName, fields) {
+  const existing = await getProfile(discordId);
   const props = {
     'Имя': { title: [{ text: { content: fields.name || userName } }] },
-    'Slack ID': { rich_text: [{ text: { content: slackId } }] },
+    'Slack ID': { rich_text: [{ text: { content: discordId } }] },
     'Специализация': { multi_select: (fields.specialization || []).map(s => ({ name: s })) },
     'Голос — как говорю': { rich_text: [{ text: { content: fields.voice || '' } }] },
     'Голос — чего избегаю': { rich_text: [{ text: { content: fields.avoid || '' } }] },
@@ -209,7 +216,7 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
 }]`;
 
   let messages = [{ role: 'user', content: prompt }];
-  let response = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, tools, messages });
+  let response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
 
   while (response.stop_reason === 'tool_use') {
     const toolUse = response.content.find(b => b.type === 'tool_use');
@@ -223,7 +230,7 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
       { role: 'assistant', content: response.content },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult }] },
     ];
-    response = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, tools, messages });
+    response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
   }
 
   const text = response.content.find(b => b.type === 'text')?.text || '[]';
@@ -232,244 +239,248 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
   } catch (e) {
     console.error('JSON parse error, retrying');
     messages = [...messages, { role: 'assistant', content: response.content }, { role: 'user', content: 'Верни ТОЛЬКО JSON массив без пояснений и markdown.' }];
-    const retry = await anthropic.messages.create({ model: 'claude-sonnet-4-20250514', max_tokens: 4000, messages });
+    const retry = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages });
     return JSON.parse(retry.content.find(b => b.type === 'text')?.text || '[]');
   }
 }
 
-// ── /ideas ────────────────────────────────────────────────────────────────────
+// ── Messaging helpers ─────────────────────────────────────────────────────────
 
-app.command('/ideas', async ({ command, ack, client }) => {
-  console.log('[/ideas] received, trigger_id:', command.trigger_id?.slice(0, 20));
-  await ack();
-  console.log('[/ideas] ack sent');
+// Пытается отредактировать/отправить ответ на интеракцию; если это по какой-то
+// причине невозможно (например, истёк 15-минутный webhook-токен на очень долгой
+// генерации), пишет пользователю в личку вместо тихого падения.
+async function safeRespond(interaction, payload) {
   try {
-    await client.views.open({
-      trigger_id: command.trigger_id,
-      view: {
-        type: 'modal',
-        callback_id: 'ideas_modal',
-        private_metadata: JSON.stringify({ channel: command.channel_id, user_id: command.user_id, user_name: command.user_name }),
-        title: { type: 'plain_text', text: '💡 Генерация идей' },
-        submit: { type: 'plain_text', text: 'Сгенерировать' },
-        close: { type: 'plain_text', text: 'Отмена' },
-        blocks: [
-          {
-            type: 'input',
-            block_id: 'count_block',
-            label: { type: 'plain_text', text: 'Количество идей' },
-            element: {
-              type: 'static_select',
-              action_id: 'count',
-              placeholder: { type: 'plain_text', text: 'Выбери количество' },
-              options: [
-                { text: { type: 'plain_text', text: '5 идей' }, value: '5' },
-                { text: { type: 'plain_text', text: '8 идей' }, value: '8' },
-                { text: { type: 'plain_text', text: '12 идей' }, value: '12' },
-              ],
-            },
-          },
-          {
-            type: 'input',
-            block_id: 'focus_block',
-            optional: true,
-            label: { type: 'plain_text', text: 'Фокус недели (необязательно)' },
-            element: {
-              type: 'plain_text_input',
-              action_id: 'focus',
-              placeholder: { type: 'plain_text', text: 'Например: профилактика кариеса у взрослых' },
-              multiline: false,
-            },
-          },
-        ],
-      },
+    if (interaction.replied || interaction.deferred) {
+      return await interaction.editReply(payload);
+    }
+    return await interaction.reply(payload);
+  } catch (err) {
+    console.error('[safeRespond] не удалось ответить на интеракцию:', err.message);
+    try {
+      return await interaction.user.send(payload);
+    } catch (dmErr) {
+      console.error('[safeRespond] личка тоже не сработала:', dmErr.message);
+      throw dmErr;
+    }
+  }
+}
+
+// ── Slash-команды ─────────────────────────────────────────────────────────────
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('ideas')
+    .setDescription('Сгенерировать контент-идеи для соцсетей')
+    .addIntegerOption(opt =>
+      opt.setName('count')
+        .setDescription('Сколько идей сгенерировать')
+        .setRequired(true)
+        .addChoices(
+          { name: '5 идей', value: 5 },
+          { name: '8 идей', value: 8 },
+          { name: '12 идей', value: 12 },
+        ))
+    .addStringOption(opt =>
+      opt.setName('focus')
+        .setDescription('Фокус недели (необязательно), например: профилактика кариеса у взрослых')
+        .setRequired(false))
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('profile')
+    .setDescription('Настроить профиль врача для персонализации идей')
+    .toJSON(),
+];
+
+async function registerCommands() {
+  const rest = new REST().setToken(process.env.DISCORD_BOT_TOKEN);
+  await rest.put(
+    Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, process.env.DISCORD_GUILD_ID),
+    { body: commands },
+  );
+  console.log('✅ Slash-команды зарегистрированы');
+}
+
+// ── Discord-клиент ────────────────────────────────────────────────────────────
+
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+function buildProfileModal(existing, specialization) {
+  const modal = new ModalBuilder()
+    .setCustomId(`profile_modal:${encodeURIComponent(specialization.join(','))}`)
+    .setTitle('👤 Мой профиль');
+
+  const nameInput = new TextInputBuilder()
+    .setCustomId('name')
+    .setLabel('Имя (как отображать в Банке идей)')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setValue(existing?.name || '');
+
+  const voiceInput = new TextInputBuilder()
+    .setCustomId('voice')
+    .setLabel('Как я говорю')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setValue(existing?.voice || '');
+
+  const avoidInput = new TextInputBuilder()
+    .setCustomId('avoid')
+    .setLabel('Чего избегаю')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setValue(existing?.avoid || '');
+
+  const worksInput = new TextInputBuilder()
+    .setCustomId('works')
+    .setLabel('Что заходит у аудитории')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setValue(existing?.works || '');
+
+  const notOnCameraInput = new TextInputBuilder()
+    .setCustomId('notOnCamera')
+    .setLabel('Не делаю в кадре')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setValue(existing?.notOnCamera || '');
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(nameInput),
+    new ActionRowBuilder().addComponents(voiceInput),
+    new ActionRowBuilder().addComponents(avoidInput),
+    new ActionRowBuilder().addComponents(worksInput),
+    new ActionRowBuilder().addComponents(notOnCameraInput),
+  );
+  return modal;
+}
+
+function ideasToEmbed(ideas, displayName) {
+  const embed = new EmbedBuilder()
+    .setTitle(`✅ ${ideas.length} идей для ${displayName}`)
+    .setColor(0x2ecc71);
+
+  for (const [i, idea] of ideas.entries()) {
+    const scriptText = (idea.script || idea.why || '').slice(0, 700);
+    embed.addFields({
+      name: `${i + 1}. ${idea.topic}`.slice(0, 256),
+      value: `${idea.format} · ${idea.source}\n💬 *Хук:* ${idea.hook}\n📋 *Сценарий:* ${scriptText}`.slice(0, 1024),
     });
-    console.log('[/ideas] modal opened');
-  } catch (err) {
-    console.error('[/ideas] error:', err.message, JSON.stringify(err.data));
   }
-});
+  return embed;
+}
 
-app.view('ideas_modal', async ({ ack, view, client, body }) => {
-  console.log('[ideas_modal] view_submission received');
-  await ack();
-  console.log('[ideas_modal] ack sent');
-
-  let channel, user_id, user_name, count, focus;
+client.on('interactionCreate', async (interaction) => {
   try {
-    const meta = JSON.parse(view.private_metadata);
-    channel = meta.channel;
-    user_id = meta.user_id;
-    user_name = meta.user_name;
-    count = parseInt(view.state.values.count_block.count.selected_option.value, 10);
-    focus = view.state.values.focus_block.focus.value || '';
-    console.log('[ideas_modal] parsed input:', { channel, user_id, count, focus });
-  } catch (err) {
-    console.error('[ideas_modal] failed to parse submission:', err);
-    return;
-  }
+    // ── /ideas ──────────────────────────────────────────────────────────────
+    if (interaction.isChatInputCommand() && interaction.commandName === 'ideas') {
+      const count = interaction.options.getInteger('count', true);
+      const focus = interaction.options.getString('focus') || '';
+      const userId = interaction.user.id;
+      const userName = interaction.user.username;
 
-  try {
-    await client.chat.postMessage({ channel, text: `⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...` });
-    console.log('[ideas_modal] "Генерирую" message sent');
-  } catch (err) {
-    console.error('[ideas_modal] failed to send "Генерирую" message:', err.message, JSON.stringify(err.data));
-    return;
-  }
+      await interaction.deferReply();
+      await interaction.editReply(`⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...`);
 
-  try {
-    const profile = await getProfile(user_id);
-    const defaultProfile = profile || { name: user_name, specialization: '🦷 Терапия, 🪥 Гигиена' };
-    const ideas = await generateIdeas({ count, focus, profile: defaultProfile, userName: user_name });
+      const profile = await getProfile(userId);
+      const defaultProfile = profile || { name: userName, specialization: '🦷 Терапия, 🪥 Гигиена' };
+      const ideas = await generateIdeas({ count, focus, profile: defaultProfile, userName });
 
-    for (const idea of ideas) {
-      try { await saveIdea(idea, defaultProfile.name || user_name); }
-      catch (e) { console.error('Notion saveIdea error:', e.message); }
+      for (const idea of ideas) {
+        try { await saveIdea(idea, defaultProfile.name || userName); }
+        catch (e) { console.error('Notion saveIdea error:', e.message); }
+      }
+
+      const notionUrl = `https://www.notion.so/${process.env.NOTION_IDEAS_DB_ID.replace(/-/g, '')}`;
+      const embed = ideasToEmbed(ideas, defaultProfile.name || userName);
+
+      await safeRespond(interaction, {
+        content: `Готово! 📋 [Открыть все идеи в Notion](${notionUrl})`,
+        embeds: [embed],
+      });
+      return;
     }
 
-    const notionUrl = `https://www.notion.so/${process.env.NOTION_IDEAS_DB_ID.replace(/-/g, '')}`;
+    // ── /profile ────────────────────────────────────────────────────────────
+    if (interaction.isChatInputCommand() && interaction.commandName === 'profile') {
+      const existing = await getProfile(interaction.user.id);
+      const select = new StringSelectMenuBuilder()
+        .setCustomId('profile_spec_select')
+        .setPlaceholder('Выбери специализацию')
+        .setMinValues(0)
+        .setMaxValues(SPECIALIZATIONS.length)
+        .addOptions(SPECIALIZATIONS.map(s => ({
+          label: s,
+          value: s,
+          default: (existing?.specialization || '').split(', ').includes(s),
+        })));
 
-    const ideaBlocks = ideas.flatMap((idea, i) => [
-      { type: 'divider' },
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `*${i + 1}. ${idea.topic}*\n${idea.format} · ${idea.source}\n\n💬 *Хук:* ${idea.hook}`,
-        },
-      },
-      {
-        type: 'section',
-        text: {
-          type: 'mrkdwn',
-          text: `📋 *Сценарий:*\n${(idea.script || idea.why || '').slice(0, 700)}`,
-        },
-      },
-    ]);
+      await interaction.reply({
+        content: 'Шаг 1/2 — выбери специализацию, затем откроется форма с остальными полями:',
+        components: [new ActionRowBuilder().addComponents(select)],
+        ephemeral: true,
+      });
+      return;
+    }
 
-    await client.chat.postMessage({
-      channel,
-      blocks: [
-        { type: 'section', text: { type: 'mrkdwn', text: `✅ *${ideas.length} идей для ${defaultProfile.name || user_name}*` } },
-        ...ideaBlocks,
-        { type: 'divider' },
-        { type: 'section', text: { type: 'mrkdwn', text: `<${notionUrl}|📋 Открыть все идеи в Notion>` } },
-      ],
-      text: `Готово! ${ideas.length} идей сгенерировано.`,
-    });
+    // ── шаг 2 профиля: выбор специализации → модалка с текстовыми полями ────
+    if (interaction.isStringSelectMenu() && interaction.customId === 'profile_spec_select') {
+      const existing = await getProfile(interaction.user.id);
+      await interaction.showModal(buildProfileModal(existing, interaction.values));
+      return;
+    }
+
+    // ── шаг 3 профиля: сабмит модалки → сохранение в Notion ─────────────────
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('profile_modal:')) {
+      const specialization = decodeURIComponent(interaction.customId.split(':')[1] || '')
+        .split(',')
+        .filter(Boolean);
+      const nameVal = interaction.fields.getTextInputValue('name') || interaction.user.username;
+
+      try {
+        await upsertProfile(interaction.user.id, interaction.user.username, {
+          name: nameVal,
+          specialization,
+          voice: interaction.fields.getTextInputValue('voice') || '',
+          avoid: interaction.fields.getTextInputValue('avoid') || '',
+          works: interaction.fields.getTextInputValue('works') || '',
+          notOnCamera: interaction.fields.getTextInputValue('notOnCamera') || '',
+        });
+        await interaction.reply({ content: '✅ Профиль обновлён!', ephemeral: true });
+      } catch (err) {
+        console.error('profile_modal error:', err);
+        await interaction.reply({ content: `❌ Ошибка: ${err.message}`, ephemeral: true });
+      }
+      return;
+    }
   } catch (err) {
-    console.error('ideas_modal error:', err);
-    await client.chat.postMessage({ channel, text: `❌ Ошибка: ${err.message}` });
-  }
-});
-
-// ── /profile ──────────────────────────────────────────────────────────────────
-
-app.command('/profile', async ({ command, ack, client }) => {
-  await ack();
-  const existing = await getProfile(command.user_id);
-  try {
-    await client.views.open({
-      trigger_id: command.trigger_id,
-      view: {
-        type: 'modal',
-        callback_id: 'profile_modal',
-        private_metadata: JSON.stringify({ user_id: command.user_id, user_name: command.user_name, channel: command.channel_id }),
-        title: { type: 'plain_text', text: '👤 Мой профиль' },
-        submit: { type: 'plain_text', text: 'Сохранить' },
-        close: { type: 'plain_text', text: 'Отмена' },
-        blocks: [
-          {
-            type: 'input',
-            block_id: 'name_block',
-            label: { type: 'plain_text', text: 'Имя (как отображать в Банке идей)' },
-            element: {
-              type: 'plain_text_input',
-              action_id: 'name',
-              initial_value: existing?.name || '',
-              placeholder: { type: 'plain_text', text: 'Например: Артём' },
-            },
-          },
-          {
-            type: 'input',
-            block_id: 'spec_block',
-            label: { type: 'plain_text', text: 'Специализация' },
-            element: {
-              type: 'checkboxes',
-              action_id: 'specialization',
-              initial_options: existing?.specialization
-                ? existing.specialization.split(', ').map(s => ({ text: { type: 'plain_text', text: s }, value: s }))
-                    .filter(o => ['🦷 Терапия', '🪥 Гигиена', '🦴 Ортопедия', '🔬 Пародонтология', '😁 Эстетика'].includes(o.value))
-                : undefined,
-              options: [
-                { text: { type: 'plain_text', text: '🦷 Терапия' }, value: '🦷 Терапия' },
-                { text: { type: 'plain_text', text: '🪥 Гигиена' }, value: '🪥 Гигиена' },
-                { text: { type: 'plain_text', text: '🦴 Ортопедия' }, value: '🦴 Ортопедия' },
-                { text: { type: 'plain_text', text: '🔬 Пародонтология' }, value: '🔬 Пародонтология' },
-                { text: { type: 'plain_text', text: '😁 Эстетика' }, value: '😁 Эстетика' },
-              ],
-            },
-          },
-          {
-            type: 'input', block_id: 'voice_block', optional: true,
-            label: { type: 'plain_text', text: 'Как я говорю' },
-            element: { type: 'plain_text_input', action_id: 'voice', initial_value: existing?.voice || '', placeholder: { type: 'plain_text', text: 'Просто, без сложных терминов' }, multiline: true },
-          },
-          {
-            type: 'input', block_id: 'avoid_block', optional: true,
-            label: { type: 'plain_text', text: 'Чего избегаю' },
-            element: { type: 'plain_text_input', action_id: 'avoid', initial_value: existing?.avoid || '', placeholder: { type: 'plain_text', text: 'Пугать пациентов' }, multiline: true },
-          },
-          {
-            type: 'input', block_id: 'works_block', optional: true,
-            label: { type: 'plain_text', text: 'Что заходит у аудитории' },
-            element: { type: 'plain_text_input', action_id: 'works', initial_value: existing?.works || '', placeholder: { type: 'plain_text', text: 'До/после, развенчание мифов' }, multiline: true },
-          },
-          {
-            type: 'input', block_id: 'notoncamera_block', optional: true,
-            label: { type: 'plain_text', text: 'Не делаю в кадре' },
-            element: { type: 'plain_text_input', action_id: 'notOnCamera', initial_value: existing?.notOnCamera || '', placeholder: { type: 'plain_text', text: 'Танцы, тренды с музыкой' }, multiline: true },
-          },
-        ],
-      },
-    });
-  } catch (err) {
-    console.error('[/profile] error:', err.message);
-  }
-});
-
-app.view('profile_modal', async ({ ack, view, client }) => {
-  await ack();
-  const meta = JSON.parse(view.private_metadata);
-  const { user_id, user_name, channel } = meta;
-  const vals = view.state.values;
-  const nameVal = vals.name_block.name.value || user_name;
-  const specialization = (vals.spec_block.specialization.selected_options || []).map(o => o.value);
-
-  try {
-    await upsertProfile(user_id, user_name, {
-      name: nameVal,
-      specialization,
-      voice: vals.voice_block.voice.value || '',
-      avoid: vals.avoid_block.avoid.value || '',
-      works: vals.works_block.works.value || '',
-      notOnCamera: vals.notoncamera_block.notOnCamera.value || '',
-    });
-    await client.chat.postMessage({ channel, text: `✅ Профиль обновлён, <@${user_id}>!` });
-  } catch (err) {
-    console.error('profile_modal error:', err);
-    await client.chat.postMessage({ channel, text: `❌ Ошибка: ${err.message}` });
+    console.error('[interactionCreate] необработанная ошибка:', err);
+    try {
+      await safeRespond(interaction, { content: `❌ Ошибка: ${err.message}` });
+    } catch (notifyErr) {
+      console.error('[interactionCreate] не удалось уведомить пользователя:', notifyErr.message);
+    }
   }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
+// Лёгкий HTTP-сервер только для health-check Railway — Discord-клиент работает
+// через WebSocket (Gateway) и сам по себе HTTP не поднимает.
+const port = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
+}).listen(port, () => console.log(`Health-check сервер слушает порт ${port}`));
+
 (async () => {
-  const port = process.env.PORT || 3000;
   try {
-    await app.start(port);
-    botStarted = true;
-    console.log(`Бот запущен на порту ${port}`);
+    await registerCommands();
+    await client.login(process.env.DISCORD_BOT_TOKEN);
+    client.once('ready', () => {
+      botStarted = true;
+      console.log(`✅ Бот запущен как ${client.user.tag}`);
+    });
   } catch (err) {
     console.error('❌ Не удалось запустить бота:', err.message);
     process.exit(1);
