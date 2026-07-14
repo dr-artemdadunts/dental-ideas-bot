@@ -251,21 +251,26 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
     response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
   }
 
-  // Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```)
-  // несмотря на просьбу этого не делать — срезаем обёртку перед парсингом.
-  function stripCodeFence(raw) {
-    return raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  // Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```) или
+  // добавляет пояснения до/после массива, несмотря на просьбу так не делать.
+  // Вместо того чтобы гадать про конкретный формат обёртки — просто вырезаем
+  // подстроку от первой "[" до последней "]" включительно.
+  function extractJsonArray(raw) {
+    const start = raw.indexOf('[');
+    const end = raw.lastIndexOf(']');
+    if (start === -1 || end === -1 || end < start) return raw.trim();
+    return raw.slice(start, end + 1);
   }
 
   const text = response.content.find(b => b.type === 'text')?.text || '[]';
   try {
-    return JSON.parse(stripCodeFence(text));
+    return JSON.parse(extractJsonArray(text));
   } catch (e) {
     console.error('JSON parse error, retrying');
     messages = [...messages, { role: 'assistant', content: response.content }, { role: 'user', content: 'Верни ТОЛЬКО JSON массив без пояснений и markdown.' }];
     const retry = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages });
     const retryText = retry.content.find(b => b.type === 'text')?.text || '[]';
-    return JSON.parse(stripCodeFence(retryText));
+    return JSON.parse(extractJsonArray(retryText));
   }
 }
 
