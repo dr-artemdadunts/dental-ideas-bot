@@ -229,7 +229,7 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
 }]`;
 
   let messages = [{ role: 'user', content: prompt }];
-  let response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
+  let response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages });
 
   while (response.stop_reason === 'tool_use') {
     // Claude может вызвать несколько инструментов параллельно за один ответ —
@@ -248,7 +248,7 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
       { role: 'assistant', content: response.content },
       { role: 'user', content: toolResults },
     ];
-    response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
+    response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages });
   }
 
   // Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```) или
@@ -262,15 +262,27 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
     return raw.slice(start, end + 1);
   }
 
+  if (response.stop_reason === 'max_tokens') {
+    console.error('[generateIdeas] ответ обрезан по max_tokens — увеличь лимит или уменьши count');
+  }
+
   const text = response.content.find(b => b.type === 'text')?.text || '[]';
   try {
     return JSON.parse(extractJsonArray(text));
   } catch (e) {
-    console.error('JSON parse error, retrying');
+    console.error('JSON parse error, retrying. stop_reason:', response.stop_reason, '| raw text (first 300 + last 300 chars):', text.slice(0, 300), '...', text.slice(-300));
     messages = [...messages, { role: 'assistant', content: response.content }, { role: 'user', content: 'Верни ТОЛЬКО JSON массив без пояснений и markdown.' }];
-    const retry = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages });
+    const retry = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages });
+    if (retry.stop_reason === 'max_tokens') {
+      console.error('[generateIdeas] retry тоже обрезан по max_tokens');
+    }
     const retryText = retry.content.find(b => b.type === 'text')?.text || '[]';
-    return JSON.parse(extractJsonArray(retryText));
+    try {
+      return JSON.parse(extractJsonArray(retryText));
+    } catch (e2) {
+      console.error('JSON parse error on retry too. stop_reason:', retry.stop_reason, '| raw text (first 300 + last 300 chars):', retryText.slice(0, 300), '...', retryText.slice(-300));
+      throw e2;
+    }
   }
 }
 
