@@ -158,13 +158,20 @@ const tools = [
 ];
 
 async function tavilySearch(query) {
-  const res = await fetch('https://api.tavily.com/search', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ api_key: process.env.TAVILY_API_KEY, query, max_results: 5, search_depth: 'basic' }),
-  });
-  const data = await res.json();
-  return (data.results || []).map(r => `${r.title}\n${r.url}\n${r.content}`).join('\n\n');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000); // без таймаута fetch может зависнуть навсегда и заморозить весь /ideas
+  try {
+    const res = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: process.env.TAVILY_API_KEY, query, max_results: 5, search_depth: 'basic' }),
+      signal: controller.signal,
+    });
+    const data = await res.json();
+    return (data.results || []).map(r => `${r.title}\n${r.url}\n${r.content}`).join('\n\n');
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function generateIdeas({ count, focus, profile, userName }) {
