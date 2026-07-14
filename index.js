@@ -49,6 +49,15 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const notion = new NotionClient({ auth: process.env.NOTION_TOKEN });
 
+// Без явного таймаута зависший внешний запрос (Notion/Anthropic) может
+// заморозить весь /ideas молча, без единой строки в логах.
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Таймаут: ${label} не ответил за ${ms}мс`)), ms)),
+  ]);
+}
+
 const SPECIALIZATIONS = ['🦷 Терапия', '🪥 Гигиена', '🦴 Ортопедия', '🔬 Пародонтология', '😁 Эстетика'];
 
 // ── Notion helpers ────────────────────────────────────────────────────────────
@@ -58,10 +67,10 @@ const SPECIALIZATIONS = ['🦷 Терапия', '🪥 Гигиена', '🦴 О�
 
 async function getProfile(discordId) {
   try {
-    const res = await notion.databases.query({
+    const res = await withTimeout(notion.databases.query({
       database_id: process.env.NOTION_PROFILES_DB_ID,
       filter: { property: 'Slack ID', rich_text: { equals: discordId } },
-    });
+    }), 20000, 'Notion getProfile');
     if (res.results.length === 0) return null;
     const page = res.results[0];
     const p = page.properties;
@@ -105,7 +114,7 @@ let cachedIdeasDbUrl = null;
 async function getIdeasDbUrl() {
   if (cachedIdeasDbUrl) return cachedIdeasDbUrl;
   try {
-    const db = await notion.databases.retrieve({ database_id: process.env.NOTION_IDEAS_DB_ID });
+    const db = await withTimeout(notion.databases.retrieve({ database_id: process.env.NOTION_IDEAS_DB_ID }), 20000, 'Notion getIdeasDbUrl');
     cachedIdeasDbUrl = db.url;
   } catch (e) {
     console.error('Notion getIdeasDbUrl error:', e.message);
@@ -117,7 +126,7 @@ async function getIdeasDbUrl() {
 async function saveIdea(idea, authorName) {
   const scriptText = idea.script || '';
   const whyText = idea.why || '';
-  await notion.pages.create({
+  await withTimeout(notion.pages.create({
     parent: { database_id: process.env.NOTION_IDEAS_DB_ID },
     properties: {
       'Тема': { title: [{ text: { content: idea.topic } }] },
@@ -140,7 +149,7 @@ async function saveIdea(idea, authorName) {
         paragraph: { rich_text: [{ type: 'text', text: { content: scriptText } }] },
       },
     ] : [],
-  });
+  }), 20000, 'Notion saveIdea');
 }
 
 // ── Claude + Tavily ───────────────────────────────────────────────────────────
@@ -259,7 +268,7 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
   const MAX_TOOL_ROUNDS = 2; // ограничиваем расходы на web_search — каждый раунд пересылает всю историю заново
 
   let messages = [{ role: 'user', content: prompt }];
-  let response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages });
+  let response = await withTimeout(anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages }), 60000, 'Anthropic initial');
   logUsage('initial', response.usage);
 
   let toolRounds = 0;
@@ -281,7 +290,7 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
       { role: 'assistant', content: response.content },
       { role: 'user', content: toolResults },
     ];
-    response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages });
+    response = await withTimeout(anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages }), 60000, `Anthropic tool round ${toolRounds}`);
     logUsage(`tool round ${toolRounds}`, response.usage);
   }
 
@@ -308,7 +317,7 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
     ...messages,
     { role: 'user', content: 'Верни ТОЛЬКО JSON массив, без markdown-обёртки (без ```), без пояснений до или после. Ответ должен начинаться сразу с символа [.' },
   ];
-  const finalResp = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages });
+  const finalResp = await withTimeout(anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages }), 60000, 'Anthropic final');
   logUsage('final', finalResp.usage);
 
   if (finalResp.stop_reason === 'max_tokens') {
@@ -458,15 +467,19 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.deferReply();
       await interaction.editReply(`⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...`);
+      console.log(`[/ideas] старт: user=${userName} count=${count} focus="${focus}"`);
 
       const profile = await getProfile(userId);
+      console.log('[/ideas] профиль получен');
       const defaultProfile = profile || { name: userName, specialization: '🦷 Терапия, 🪥 Гигиена' };
       const ideas = await generateIdeas({ count, focus, profile: defaultProfile, userName });
+      console.log(`[/ideas] сгенерировано идей: ${ideas.length}`);
 
       for (const idea of ideas) {
         try { await saveIdea(idea, defaultProfile.name || userName); }
         catch (e) { console.error('Notion saveIdea error:', e.message); }
       }
+      console.log('[/ideas] идеи сохранены в Notion');
 
       const notionUrl = await getIdeasDbUrl();
       const embed = ideasToEmbed(ideas, defaultProfile.name || userName);
