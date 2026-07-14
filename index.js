@@ -219,16 +219,21 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
   let response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
 
   while (response.stop_reason === 'tool_use') {
-    const toolUse = response.content.find(b => b.type === 'tool_use');
-    let toolResult = '';
-    if (toolUse.name === 'web_search') {
-      try { toolResult = await tavilySearch(toolUse.input.query); }
-      catch (e) { toolResult = 'Поиск недоступен: ' + e.message; }
-    }
+    // Claude может вызвать несколько инструментов параллельно за один ответ —
+    // на каждый tool_use блок обязательно нужен свой tool_result, иначе 400.
+    const toolUses = response.content.filter(b => b.type === 'tool_use');
+    const toolResults = await Promise.all(toolUses.map(async (toolUse) => {
+      let toolResult = '';
+      if (toolUse.name === 'web_search') {
+        try { toolResult = await tavilySearch(toolUse.input.query); }
+        catch (e) { toolResult = 'Поиск недоступен: ' + e.message; }
+      }
+      return { type: 'tool_result', tool_use_id: toolUse.id, content: toolResult };
+    }));
     messages = [
       ...messages,
       { role: 'assistant', content: response.content },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult }] },
+      { role: 'user', content: toolResults },
     ];
     response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
   }
