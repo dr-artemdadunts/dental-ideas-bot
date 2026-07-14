@@ -347,13 +347,10 @@ const commands = [
     .setDescription('Сгенерировать контент-идеи для соцсетей')
     .addIntegerOption(opt =>
       opt.setName('count')
-        .setDescription('Сколько идей сгенерировать')
+        .setDescription('Сколько идей сгенерировать (1-10)')
         .setRequired(true)
-        .addChoices(
-          { name: '5 идей', value: 5 },
-          { name: '8 идей', value: 8 },
-          { name: '12 идей', value: 12 },
-        ))
+        .setMinValue(1)
+        .setMaxValue(10))
     .addStringOption(opt =>
       opt.setName('focus')
         .setDescription('Фокус недели (необязательно), например: профилактика кариеса у взрослых')
