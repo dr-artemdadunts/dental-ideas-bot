@@ -294,26 +294,25 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
     ];
   }
 
-  // Финальный вызов всегда идёт без tools и с prefill "[" — это гарантирует
-  // чистый JSON без markdown-обёртки и убирает необходимость retry-запроса
-  // с пересылкой всей истории (та ошибка, что жгла баланс раньше).
+  // claude-sonnet-4-6 не поддерживает prefill ассистента (400 invalid_request_error),
+  // поэтому финальный вызов идёт без tools с жёсткой текстовой инструкцией,
+  // а извлечение JSON опирается на extractJsonArray (bracket-extraction).
   messages = [
     ...messages,
-    { role: 'user', content: 'Верни ТОЛЬКО JSON массив, без markdown и пояснений.' },
-    { role: 'assistant', content: '[' },
+    { role: 'user', content: 'Верни ТОЛЬКО JSON массив, без markdown-обёртки (без ```), без пояснений до или после. Ответ должен начинаться сразу с символа [.' },
   ];
   const finalResp = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages });
-  logUsage('final (prefill)', finalResp.usage);
+  logUsage('final', finalResp.usage);
 
   if (finalResp.stop_reason === 'max_tokens') {
     console.error('[generateIdeas] финальный ответ обрезан по max_tokens — увеличь лимит или уменьши count');
   }
 
-  const finalText = '[' + (finalResp.content.find(b => b.type === 'text')?.text || ']');
+  const finalText = finalResp.content.find(b => b.type === 'text')?.text || '[]';
   try {
     return JSON.parse(extractJsonArray(finalText));
   } catch (e) {
-    console.error('JSON parse error даже после prefill. stop_reason:', finalResp.stop_reason, '| raw text (first 300 + last 300 chars):', finalText.slice(0, 300), '...', finalText.slice(-300));
+    console.error('JSON parse error. stop_reason:', finalResp.stop_reason, '| raw text (first 300 + last 300 chars):', finalText.slice(0, 300), '...', finalText.slice(-300));
     throw e;
   }
 }
