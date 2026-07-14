@@ -238,14 +238,21 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
     response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, tools, messages });
   }
 
+  // Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```)
+  // несмотря на просьбу этого не делать — срезаем обёртку перед парсингом.
+  function stripCodeFence(raw) {
+    return raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  }
+
   const text = response.content.find(b => b.type === 'text')?.text || '[]';
   try {
-    return JSON.parse(text);
+    return JSON.parse(stripCodeFence(text));
   } catch (e) {
     console.error('JSON parse error, retrying');
     messages = [...messages, { role: 'assistant', content: response.content }, { role: 'user', content: 'Верни ТОЛЬКО JSON массив без пояснений и markdown.' }];
     const retry = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages });
-    return JSON.parse(retry.content.find(b => b.type === 'text')?.text || '[]');
+    const retryText = retry.content.find(b => b.type === 'text')?.text || '[]';
+    return JSON.parse(stripCodeFence(retryText));
   }
 }
 
