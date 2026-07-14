@@ -228,10 +228,36 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
   "script": "3-5 конкретных тезисов через • что говорить в этом контенте"
 }]`;
 
+  // Грубая оценка цены по прайсу claude-sonnet-4-6 ($3/$15 за 1M токенов) —
+  // если модель другая, цифра будет неточной, но порядок величины виден.
+  function logUsage(label, usage) {
+    if (!usage) return;
+    const inTok = usage.input_tokens || 0;
+    const outTok = usage.output_tokens || 0;
+    const cost = (inTok / 1e6) * 3 + (outTok / 1e6) * 15;
+    console.log(`[usage] ${label}: in=${inTok} out=${outTok} ~$${cost.toFixed(4)}`);
+  }
+
+  // Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```) или
+  // добавляет пояснения до/после массива, несмотря на просьбу так не делать.
+  // Вместо того чтобы гадать про конкретный формат обёртки — просто вырезаем
+  // подстроку от первой "[" до последней "]" включительно.
+  function extractJsonArray(raw) {
+    const start = raw.indexOf('[');
+    const end = raw.lastIndexOf(']');
+    if (start === -1 || end === -1 || end < start) return raw.trim();
+    return raw.slice(start, end + 1);
+  }
+
+  const MAX_TOOL_ROUNDS = 2; // ограничиваем расходы на web_search — каждый раунд пересылает всю историю заново
+
   let messages = [{ role: 'user', content: prompt }];
   let response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages });
+  logUsage('initial', response.usage);
 
-  while (response.stop_reason === 'tool_use') {
+  let toolRounds = 0;
+  while (response.stop_reason === 'tool_use' && toolRounds < MAX_TOOL_ROUNDS) {
+    toolRounds++;
     // Claude может вызвать несколько инструментов параллельно за один ответ —
     // на каждый tool_use блок обязательно нужен свой tool_result, иначе 400.
     const toolUses = response.content.filter(b => b.type === 'tool_use');
@@ -249,40 +275,46 @@ ${focus ? `Фокус этой недели: ${focus}` : ''}
       { role: 'user', content: toolResults },
     ];
     response = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, tools, messages });
+    logUsage(`tool round ${toolRounds}`, response.usage);
   }
 
-  // Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```) или
-  // добавляет пояснения до/после массива, несмотря на просьбу так не делать.
-  // Вместо того чтобы гадать про конкретный формат обёртки — просто вырезаем
-  // подстроку от первой "[" до последней "]" включительно.
-  function extractJsonArray(raw) {
-    const start = raw.indexOf('[');
-    const end = raw.lastIndexOf(']');
-    if (start === -1 || end === -1 || end < start) return raw.trim();
-    return raw.slice(start, end + 1);
+  // Если лимит раундов поиска исчерпан, а Claude всё ещё просит искать —
+  // принудительно завершаем без дальнейших tool-запросов.
+  if (response.stop_reason === 'tool_use') {
+    const toolUses = response.content.filter(b => b.type === 'tool_use');
+    const toolResults = toolUses.map(toolUse => ({
+      type: 'tool_result',
+      tool_use_id: toolUse.id,
+      content: 'Лимит поисков исчерпан — отвечай на основе того, что уже нашёл.',
+    }));
+    messages = [
+      ...messages,
+      { role: 'assistant', content: response.content },
+      { role: 'user', content: toolResults },
+    ];
   }
 
-  if (response.stop_reason === 'max_tokens') {
-    console.error('[generateIdeas] ответ обрезан по max_tokens — увеличь лимит или уменьши count');
+  // Финальный вызов всегда идёт без tools и с prefill "[" — это гарантирует
+  // чистый JSON без markdown-обёртки и убирает необходимость retry-запроса
+  // с пересылкой всей истории (та ошибка, что жгла баланс раньше).
+  messages = [
+    ...messages,
+    { role: 'user', content: 'Верни ТОЛЬКО JSON массив, без markdown и пояснений.' },
+    { role: 'assistant', content: '[' },
+  ];
+  const finalResp = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages });
+  logUsage('final (prefill)', finalResp.usage);
+
+  if (finalResp.stop_reason === 'max_tokens') {
+    console.error('[generateIdeas] финальный ответ обрезан по max_tokens — увеличь лимит или уменьши count');
   }
 
-  const text = response.content.find(b => b.type === 'text')?.text || '[]';
+  const finalText = '[' + (finalResp.content.find(b => b.type === 'text')?.text || ']');
   try {
-    return JSON.parse(extractJsonArray(text));
+    return JSON.parse(extractJsonArray(finalText));
   } catch (e) {
-    console.error('JSON parse error, retrying. stop_reason:', response.stop_reason, '| raw text (first 300 + last 300 chars):', text.slice(0, 300), '...', text.slice(-300));
-    messages = [...messages, { role: 'assistant', content: response.content }, { role: 'user', content: 'Верни ТОЛЬКО JSON массив без пояснений и markdown.' }];
-    const retry = await anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages });
-    if (retry.stop_reason === 'max_tokens') {
-      console.error('[generateIdeas] retry тоже обрезан по max_tokens');
-    }
-    const retryText = retry.content.find(b => b.type === 'text')?.text || '[]';
-    try {
-      return JSON.parse(extractJsonArray(retryText));
-    } catch (e2) {
-      console.error('JSON parse error on retry too. stop_reason:', retry.stop_reason, '| raw text (first 300 + last 300 chars):', retryText.slice(0, 300), '...', retryText.slice(-300));
-      throw e2;
-    }
+    console.error('JSON parse error даже после prefill. stop_reason:', finalResp.stop_reason, '| raw text (first 300 + last 300 chars):', finalText.slice(0, 300), '...', finalText.slice(-300));
+    throw e;
   }
 }
 
