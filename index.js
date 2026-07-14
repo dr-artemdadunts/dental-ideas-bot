@@ -143,6 +143,31 @@ async function saveIdea(idea, authorName) {
   }), 20000, 'Notion saveIdea');
 }
 
+// Идеи со статусом "❌ Отклонено" автоматически удаляются (архивируются) через
+// минуту после отклонения — проверяем last_edited_time страницы, т.к. он
+// обновляется в момент смены статуса и не требует отдельного свойства-даты.
+const REJECTED_STATUS = '❌ Отклонено';
+const REJECTED_TTL_MS = 60 * 1000;
+
+async function cleanupRejectedIdeas() {
+  try {
+    const res = await withTimeout(notion.databases.query({
+      database_id: process.env.NOTION_IDEAS_DB_ID,
+      filter: { property: 'Статус', select: { equals: REJECTED_STATUS } },
+    }), 20000, 'Notion cleanupRejectedIdeas query');
+
+    const now = Date.now();
+    for (const page of res.results) {
+      const editedAt = new Date(page.last_edited_time).getTime();
+      if (now - editedAt < REJECTED_TTL_MS) continue;
+      await withTimeout(notion.pages.update({ page_id: page.id, archived: true }), 20000, 'Notion cleanupRejectedIdeas archive');
+      console.log(`[cleanup] удалена отклонённая идея: ${page.id}`);
+    }
+  } catch (e) {
+    console.error('cleanupRejectedIdeas error:', e.message);
+  }
+}
+
 // ── Claude + Tavily ───────────────────────────────────────────────────────────
 
 const tools = [
@@ -452,6 +477,7 @@ http.createServer((req, res) => {
     client.once('ready', () => {
       botStarted = true;
       console.log(`✅ Бот запущен как ${client.user.tag}`);
+      setInterval(cleanupRejectedIdeas, 60000);
     });
   } catch (err) {
     console.error('❌ Не удалось запустить бота:', err.message);
