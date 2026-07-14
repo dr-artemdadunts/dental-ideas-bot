@@ -6,11 +6,6 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
-  ActionRowBuilder,
-  StringSelectMenuBuilder,
   EmbedBuilder,
 } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -23,7 +18,7 @@ const REQUIRED_ENV_VARS = [
   'ANTHROPIC_API_KEY',
   'NOTION_TOKEN',
   'NOTION_IDEAS_DB_ID',
-  'NOTION_PROFILES_DB_ID',
+  'NOTION_PROFILE_PAGE_ID',
 ];
 
 const missingEnvVars = REQUIRED_ENV_VARS.filter(name => !process.env[name]);
@@ -58,55 +53,51 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-const SPECIALIZATIONS = ['🦷 Терапия', '🪥 Гигиена', '🦴 Ортопедия', '🔬 Пародонтология', '😁 Эстетика'];
-
 // ── Notion helpers ────────────────────────────────────────────────────────────
-// Примечание: свойство в Notion по-прежнему называется "Slack ID" — это просто
-// текстовое поле для внешнего ID пользователя, теперь в нём хранится Discord ID.
-// Переименовать колонку в Notion можно в любой момент, на логику это не влияет.
 
-async function getProfile(discordId) {
-  try {
-    const res = await withTimeout(notion.databases.query({
-      database_id: process.env.NOTION_PROFILES_DB_ID,
-      filter: { property: 'Slack ID', rich_text: { equals: discordId } },
-    }), 20000, 'Notion getProfile');
-    if (res.results.length === 0) return null;
-    const page = res.results[0];
-    const p = page.properties;
-    return {
-      id: page.id,
-      name: p['Имя']?.title?.[0]?.plain_text || '',
-      specialization: p['Специализация']?.multi_select?.map(s => s.name).join(', ') || '',
-      voice: p['Голос — как говорю']?.rich_text?.[0]?.plain_text || '',
-      avoid: p['Голос — чего избегаю']?.rich_text?.[0]?.plain_text || '',
-      works: p['Голос — что заходит']?.rich_text?.[0]?.plain_text || '',
-      notOnCamera: p['Голос — не делаю в кадре']?.rich_text?.[0]?.plain_text || '',
-    };
-  } catch (e) {
-    console.error('Notion getProfile error:', e.message);
-    return null;
-  }
+// Профиль врача — теперь один-единственный, живёт как обычная Notion-страница
+// (не база данных), которую врач редактирует вручную прямо в Notion.
+// Бот читает страницу заново при каждом /ideas, так что правки применяются сразу,
+// без передеплоя. Формат: заголовок (## Поле) + текст/список под ним.
+const PROFILE_FIELD_MAP = {
+  'имя': 'name',
+  'специализация': 'specialization',
+  'голос — как говорю': 'voice',
+  'голос — чего избегаю': 'avoid',
+  'голос — что заходит': 'works',
+  'голос — не делаю в кадре': 'notOnCamera',
+};
+
+function blockPlainText(block) {
+  const richText = block[block.type]?.rich_text || [];
+  return richText.map(t => t.plain_text).join('');
 }
 
-async function upsertProfile(discordId, userName, fields) {
-  const existing = await getProfile(discordId);
-  const props = {
-    'Имя': { title: [{ text: { content: fields.name || userName } }] },
-    'Slack ID': { rich_text: [{ text: { content: discordId } }] },
-    'Специализация': { multi_select: (fields.specialization || []).map(s => ({ name: s })) },
-    'Голос — как говорю': { rich_text: [{ text: { content: fields.voice || '' } }] },
-    'Голос — чего избегаю': { rich_text: [{ text: { content: fields.avoid || '' } }] },
-    'Голос — что заходит': { rich_text: [{ text: { content: fields.works || '' } }] },
-    'Голос — не делаю в кадре': { rich_text: [{ text: { content: fields.notOnCamera || '' } }] },
-  };
-  if (existing) {
-    await notion.pages.update({ page_id: existing.id, properties: props });
-  } else {
-    await notion.pages.create({
-      parent: { database_id: process.env.NOTION_PROFILES_DB_ID },
-      properties: props,
-    });
+async function getDoctorProfile() {
+  const fallback = { name: 'Доктор', specialization: '🦷 Терапия, 🪥 Гигиена', voice: '', avoid: '', works: '', notOnCamera: '' };
+  try {
+    const res = await withTimeout(
+      notion.blocks.children.list({ block_id: process.env.NOTION_PROFILE_PAGE_ID, page_size: 100 }),
+      20000,
+      'Notion getDoctorProfile',
+    );
+    const profile = {};
+    let currentKey = null;
+    for (const block of res.results) {
+      if (block.type?.startsWith('heading_')) {
+        const headingText = blockPlainText(block).trim().toLowerCase();
+        currentKey = PROFILE_FIELD_MAP[headingText] || null;
+        continue;
+      }
+      if (!currentKey) continue;
+      const text = blockPlainText(block).trim();
+      if (!text || text.startsWith('(')) continue; // пропускаем плейсхолдеры "(заполнить: ...)"
+      profile[currentKey] = profile[currentKey] ? `${profile[currentKey]}\n${text}` : text;
+    }
+    return { ...fallback, ...profile };
+  } catch (e) {
+    console.error('Notion getDoctorProfile error:', e.message);
+    return fallback;
   }
 }
 
@@ -372,10 +363,6 @@ const commands = [
         .setDescription('Фокус недели (необязательно), например: профилактика кариеса у взрослых')
         .setRequired(false))
     .toJSON(),
-  new SlashCommandBuilder()
-    .setName('profile')
-    .setDescription('Настроить профиль врача для персонализации идей')
-    .toJSON(),
 ];
 
 async function registerCommands() {
@@ -390,56 +377,6 @@ async function registerCommands() {
 // ── Discord-клиент ────────────────────────────────────────────────────────────
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-function buildProfileModal(existing, specialization) {
-  const modal = new ModalBuilder()
-    .setCustomId(`profile_modal:${encodeURIComponent(specialization.join(','))}`)
-    .setTitle('👤 Мой профиль');
-
-  const nameInput = new TextInputBuilder()
-    .setCustomId('name')
-    .setLabel('Имя (как отображать в Банке идей)')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(existing?.name || '');
-
-  const voiceInput = new TextInputBuilder()
-    .setCustomId('voice')
-    .setLabel('Как я говорю')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(existing?.voice || '');
-
-  const avoidInput = new TextInputBuilder()
-    .setCustomId('avoid')
-    .setLabel('Чего избегаю')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(existing?.avoid || '');
-
-  const worksInput = new TextInputBuilder()
-    .setCustomId('works')
-    .setLabel('Что заходит у аудитории')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(existing?.works || '');
-
-  const notOnCameraInput = new TextInputBuilder()
-    .setCustomId('notOnCamera')
-    .setLabel('Не делаю в кадре')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(existing?.notOnCamera || '');
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(nameInput),
-    new ActionRowBuilder().addComponents(voiceInput),
-    new ActionRowBuilder().addComponents(avoidInput),
-    new ActionRowBuilder().addComponents(worksInput),
-    new ActionRowBuilder().addComponents(notOnCameraInput),
-  );
-  return modal;
-}
 
 function ideasToEmbed(ideas, displayName) {
   const embed = new EmbedBuilder()
@@ -462,85 +399,30 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand() && interaction.commandName === 'ideas') {
       const count = interaction.options.getInteger('count', true);
       const focus = interaction.options.getString('focus') || '';
-      const userId = interaction.user.id;
       const userName = interaction.user.username;
 
       await interaction.deferReply();
       await interaction.editReply(`⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...`);
       console.log(`[/ideas] старт: user=${userName} count=${count} focus="${focus}"`);
 
-      const profile = await getProfile(userId);
+      const profile = await getDoctorProfile();
       console.log('[/ideas] профиль получен');
-      const defaultProfile = profile || { name: userName, specialization: '🦷 Терапия, 🪥 Гигиена' };
-      const ideas = await generateIdeas({ count, focus, profile: defaultProfile, userName });
+      const ideas = await generateIdeas({ count, focus, profile, userName });
       console.log(`[/ideas] сгенерировано идей: ${ideas.length}`);
 
       for (const idea of ideas) {
-        try { await saveIdea(idea, defaultProfile.name || userName); }
+        try { await saveIdea(idea, profile.name); }
         catch (e) { console.error('Notion saveIdea error:', e.message); }
       }
       console.log('[/ideas] идеи сохранены в Notion');
 
       const notionUrl = await getIdeasDbUrl();
-      const embed = ideasToEmbed(ideas, defaultProfile.name || userName);
+      const embed = ideasToEmbed(ideas, profile.name);
 
       await safeRespond(interaction, {
         content: `Готово! 📋 [Открыть все идеи в Notion](${notionUrl})`,
         embeds: [embed],
       });
-      return;
-    }
-
-    // ── /profile ────────────────────────────────────────────────────────────
-    if (interaction.isChatInputCommand() && interaction.commandName === 'profile') {
-      const existing = await getProfile(interaction.user.id);
-      const select = new StringSelectMenuBuilder()
-        .setCustomId('profile_spec_select')
-        .setPlaceholder('Выбери специализацию')
-        .setMinValues(0)
-        .setMaxValues(SPECIALIZATIONS.length)
-        .addOptions(SPECIALIZATIONS.map(s => ({
-          label: s,
-          value: s,
-          default: (existing?.specialization || '').split(', ').includes(s),
-        })));
-
-      await interaction.reply({
-        content: 'Шаг 1/2 — выбери специализацию, затем откроется форма с остальными полями:',
-        components: [new ActionRowBuilder().addComponents(select)],
-        ephemeral: true,
-      });
-      return;
-    }
-
-    // ── шаг 2 профиля: выбор специализации → модалка с текстовыми полями ────
-    if (interaction.isStringSelectMenu() && interaction.customId === 'profile_spec_select') {
-      const existing = await getProfile(interaction.user.id);
-      await interaction.showModal(buildProfileModal(existing, interaction.values));
-      return;
-    }
-
-    // ── шаг 3 профиля: сабмит модалки → сохранение в Notion ─────────────────
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('profile_modal:')) {
-      const specialization = decodeURIComponent(interaction.customId.split(':')[1] || '')
-        .split(',')
-        .filter(Boolean);
-      const nameVal = interaction.fields.getTextInputValue('name') || interaction.user.username;
-
-      try {
-        await upsertProfile(interaction.user.id, interaction.user.username, {
-          name: nameVal,
-          specialization,
-          voice: interaction.fields.getTextInputValue('voice') || '',
-          avoid: interaction.fields.getTextInputValue('avoid') || '',
-          works: interaction.fields.getTextInputValue('works') || '',
-          notOnCamera: interaction.fields.getTextInputValue('notOnCamera') || '',
-        });
-        await interaction.reply({ content: '✅ Профиль обновлён!', ephemeral: true });
-      } catch (err) {
-        console.error('profile_modal error:', err);
-        await interaction.reply({ content: `❌ Ошибка: ${err.message}`, ephemeral: true });
-      }
       return;
     }
   } catch (err) {
