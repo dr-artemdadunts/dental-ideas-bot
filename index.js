@@ -101,6 +101,19 @@ async function upsertProfile(discordId, userName, fields) {
   }
 }
 
+let cachedIdeasDbUrl = null;
+async function getIdeasDbUrl() {
+  if (cachedIdeasDbUrl) return cachedIdeasDbUrl;
+  try {
+    const db = await notion.databases.retrieve({ database_id: process.env.NOTION_IDEAS_DB_ID });
+    cachedIdeasDbUrl = db.url;
+  } catch (e) {
+    console.error('Notion getIdeasDbUrl error:', e.message);
+    cachedIdeasDbUrl = `https://www.notion.so/${process.env.NOTION_IDEAS_DB_ID.replace(/-/g, '')}`;
+  }
+  return cachedIdeasDbUrl;
+}
+
 async function saveIdea(idea, authorName) {
   const scriptText = idea.script || '';
   const whyText = idea.why || '';
@@ -403,7 +416,7 @@ client.on('interactionCreate', async (interaction) => {
         catch (e) { console.error('Notion saveIdea error:', e.message); }
       }
 
-      const notionUrl = `https://www.notion.so/${process.env.NOTION_IDEAS_DB_ID.replace(/-/g, '')}`;
+      const notionUrl = await getIdeasDbUrl();
       const embed = ideasToEmbed(ideas, defaultProfile.name || userName);
 
       await safeRespond(interaction, {
