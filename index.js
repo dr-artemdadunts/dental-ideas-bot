@@ -677,7 +677,7 @@ function buildIdeasModal() {
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('audience')
-          .setLabel('Аудитория (необязательно, по умолч. проактивный)')
+          .setLabel('Аудитория (дефолт: проактивный)')
           .setPlaceholder('тревожный / проактивный / скептик / mixed')
           .setStyle(TextInputStyle.Short)
           .setRequired(false),
