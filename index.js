@@ -13,6 +13,7 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  StringSelectMenuBuilder,
   PermissionFlagsBits,
 } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -650,38 +651,47 @@ function buildIdeasModal() {
   return new ModalBuilder()
     .setCustomId('ideas_modal')
     .setTitle('Сгенерировать идеи')
-    .addComponents(
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
+    .addLabelComponents(
+      label => label
+        .setLabel('Сколько идей (1-10)')
+        .setTextInputComponent(input => input
           .setCustomId('count')
-          .setLabel('Сколько идей (1-10)')
           .setStyle(TextInputStyle.Short)
           .setValue('5')
-          .setRequired(true),
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
+          .setRequired(true)),
+      label => label
+        .setLabel('Фокус недели')
+        .setTextInputComponent(input => input
           .setCustomId('focus')
-          .setLabel('Фокус недели (необязательно)')
           .setStyle(TextInputStyle.Short)
-          .setRequired(false),
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
+          .setRequired(false)),
+      label => label
+        .setLabel('Формат')
+        .setStringSelectMenuComponent(select => select
           .setCustomId('format')
-          .setLabel('Формат (необязательно)')
-          .setPlaceholder('🎬 Reels 30 сек / 🎬 Reels 60 сек / 🎠 Карусель / 📝 Пост / 🔬 Научная ветка')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false),
-      ),
-      new ActionRowBuilder().addComponents(
-        new TextInputBuilder()
+          .setPlaceholder('Не выбрано — формат подберёт бот')
+          .setMinValues(0)
+          .setMaxValues(1)
+          .addOptions(
+            { label: '🎬 Reels 30 сек', value: '🎬 Reels 30 сек' },
+            { label: '🎬 Reels 60 сек', value: '🎬 Reels 60 сек' },
+            { label: '🎠 Карусель', value: '🎠 Карусель' },
+            { label: '📝 Пост', value: '📝 Пост' },
+            { label: '🔬 Научная ветка', value: '🔬 Научная ветка' },
+          )),
+      label => label
+        .setLabel('Аудитория')
+        .setStringSelectMenuComponent(select => select
           .setCustomId('audience')
-          .setLabel('Аудитория (дефолт: проактивный)')
-          .setPlaceholder('тревожный / проактивный / скептик / mixed')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false),
-      ),
+          .setPlaceholder('Не выбрано — по умолчанию проактивный')
+          .setMinValues(0)
+          .setMaxValues(1)
+          .addOptions(
+            { label: 'Тревожный пациент', value: 'тревожный пациент ("боюсь, что что-то не так")' },
+            { label: 'Проактивный', value: 'проактивный ("хочу быть лучшей версией себя")' },
+            { label: 'Скептик', value: 'скептик ("врачи разводят на деньги")' },
+            { label: 'Смешанная (без прицела)', value: 'mixed' },
+          )),
     );
 }
 
@@ -850,9 +860,9 @@ client.on('interactionCreate', async (interaction) => {
       const countRaw = parseInt(interaction.fields.getTextInputValue('count'), 10);
       const count = Number.isFinite(countRaw) ? Math.min(10, Math.max(1, countRaw)) : 5;
       const focus = interaction.fields.getTextInputValue('focus') || '';
-      const format = interaction.fields.getTextInputValue('format') || '';
-      const audienceRaw = interaction.fields.getTextInputValue('audience');
-      const audience = normalizeAudience(audienceRaw);
+      const format = interaction.fields.getStringSelectValues('format')[0] || '';
+      const audienceRaw = interaction.fields.getStringSelectValues('audience')[0] || null;
+      const audience = audienceRaw === 'mixed' ? '' : normalizeAudience(audienceRaw);
       const userName = interaction.user.username;
 
       await interaction.deferReply();
