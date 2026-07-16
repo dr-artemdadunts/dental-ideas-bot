@@ -517,7 +517,7 @@ async function generateScripts(idea, profile) {
 ]}`;
 
   const draftResp = await withTimeout(
-    anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages: [{ role: 'user', content: draftPrompt }] }),
+    anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages: [{ role: 'user', content: draftPrompt }] }),
     60000, 'Anthropic script draft',
   );
   logUsage('script draft', draftResp.usage);
@@ -557,7 +557,7 @@ ${JSON.stringify(draft)}
 ]}`;
 
   const critiqueResp = await withTimeout(
-    anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages: [{ role: 'user', content: critiquePrompt }] }),
+    anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages: [{ role: 'user', content: critiquePrompt }] }),
     60000, 'Anthropic script critique',
   );
   logUsage('script critique', critiqueResp.usage);
@@ -577,7 +577,8 @@ function tableRow(cells) {
   return {
     object: 'block',
     type: 'table_row',
-    table_row: { cells: cells.map(c => [{ type: 'text', text: { content: (c || '').slice(0, 1900) } }]) },
+    // Notion отклоняет rich_text с пустым content — подставляем плейсхолдер вместо ''.
+    table_row: { cells: cells.map(c => [{ type: 'text', text: { content: (c && c.trim()) ? c.slice(0, 1900) : '—' } }]) },
   };
 }
 
@@ -834,6 +835,7 @@ async function runDevelop(interaction) {
 
   const profile = await getDoctorProfile();
   let done = 0;
+  const errors = [];
   for (const page of res.results) {
     const props = page.properties;
     const idea = {
@@ -853,12 +855,14 @@ async function runDevelop(interaction) {
       done++;
       console.log(`[develop] сценарий готов: ${page.id}`);
     } catch (e) {
-      console.error('[develop] ошибка на идее', page.id, e.message);
+      console.error('[develop] ошибка на идее', page.id, e.stack || e.message);
+      errors.push(`«${idea.topic.slice(0, 60)}»: ${e.message}`);
     }
   }
 
+  const errorSummary = errors.length ? `\n\n⚠️ Ошибки:\n${errors.map(m => `• ${m}`).join('\n')}`.slice(0, 1500) : '';
   await safeRespond(interaction, {
-    content: `Готово! ✍️ Сценарии написаны для ${done}/${res.results.length} идей. Статус изменён на "🎬 В конвейере".`,
+    content: `Готово! ✍️ Сценарии написаны для ${done}/${res.results.length} идей. Статус изменён на "🎬 В конвейере".${errorSummary}`,
   });
 }
 
