@@ -518,7 +518,7 @@ async function generateScripts(idea, profile) {
 
   const draftResp = await withTimeout(
     anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages: [{ role: 'user', content: draftPrompt }] }),
-    60000, 'Anthropic script draft',
+    120000, 'Anthropic script draft',
   );
   logUsage('script draft', draftResp.usage);
   const draftText = draftResp.content.find(b => b.type === 'text')?.text || '{}';
@@ -558,7 +558,7 @@ ${JSON.stringify(draft)}
 
   const critiqueResp = await withTimeout(
     anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 8000, messages: [{ role: 'user', content: critiquePrompt }] }),
-    60000, 'Anthropic script critique',
+    120000, 'Anthropic script critique',
   );
   logUsage('script critique', critiqueResp.usage);
   const critiqueText = critiqueResp.content.find(b => b.type === 'text')?.text || '{}';
