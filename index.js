@@ -562,13 +562,23 @@ ${JSON.stringify(draft)}
   );
   logUsage('script critique', critiqueResp.usage);
   const critiqueText = critiqueResp.content.find(b => b.type === 'text')?.text || '{}';
+  let styles;
   try {
     const final = JSON.parse(extractJsonObject(critiqueText));
-    return final.styles || draft.styles || [];
+    styles = (Array.isArray(final.styles) && final.styles.length > 0) ? final.styles : draft.styles;
   } catch (e) {
     console.error('[generateScripts] critique JSON parse error, использую черновик:', e.message);
-    return draft.styles || [];
+    styles = draft.styles;
   }
+
+  if (!Array.isArray(styles) || styles.length === 0) {
+    throw new Error('Модель не вернула ни одного стиля сценария (пустой/некорректный ответ)');
+  }
+  const hasContent = styles.some(s => (Array.isArray(s.beats) && s.beats.length > 0) || s.text);
+  if (!hasContent) {
+    throw new Error('Стили сценария вернулись без содержимого (нет ни beats, ни text)');
+  }
+  return styles;
 }
 
 // Дописывает сценарии в конец страницы идеи в Notion — каждый стиль своим
@@ -616,6 +626,9 @@ async function saveScriptsToPage(pageId, styles) {
         });
       }
     }
+  }
+  if (children.length === 0) {
+    throw new Error('Нечего сохранять в Notion — сценарии пусты');
   }
   await withTimeout(notion.blocks.children.append({ block_id: pageId, children }), 20000, 'Notion saveScriptsToPage');
 }
