@@ -352,10 +352,13 @@ aversion), угроза идентичности "я думал что дела�
 
 СТРОГИЕ ОГРАНИЧЕНИЯ:
 - Только темы строго по специализации врача
-- Только СНГ-контекст: реалии, менталитет, страхи пациентов из
-  России/Украины/Казахстана
+- Контекст: русскоговорящие релоканты в Армении. Это люди, оторванные от
+  привычной клиники, в новой стране, не знающие местных реалий и не
+  понимающие, кому здесь можно верить. Их страхи — не "а вдруг больно",
+  а "а вдруг тут разведут / сделают хуже, чем дома / я не смогу проверить
+  квалификацию". Учитывай это, а не общий менталитет СНГ.
 - БЕЗ тем про цены и стоимость
-- БЕЗ западных трендов без адаптации под СНГ
+- БЕЗ западных трендов без адаптации под эту аудиторию
 
 Верни ТОЛЬКО валидный JSON массив без markdown и пояснений:
 [{
@@ -607,6 +610,7 @@ const commands = [
           { name: 'Тревожный пациент', value: 'тревожный пациент ("боюсь, что что-то не так")' },
           { name: 'Проактивный', value: 'проактивный ("хочу быть лучшей версией себя")' },
           { name: 'Скептик', value: 'скептик ("врачи разводят на деньги")' },
+          { name: 'Смешанная (без прицела)', value: 'mixed' },
         ))
     .toJSON(),
   new SlashCommandBuilder()
@@ -649,7 +653,10 @@ client.on('interactionCreate', async (interaction) => {
       const count = interaction.options.getInteger('count', true);
       const focus = interaction.options.getString('focus') || '';
       const format = interaction.options.getString('format') || '';
-      const audience = interaction.options.getString('audience') || '';
+      const audienceRaw = interaction.options.getString('audience');
+      const audience = audienceRaw === null
+        ? 'проактивный ("хочу быть лучшей версией себя")'
+        : (audienceRaw === 'mixed' ? '' : audienceRaw);
       const userName = interaction.user.username;
 
       await interaction.deferReply();
