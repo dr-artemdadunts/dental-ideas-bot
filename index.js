@@ -185,15 +185,57 @@ async function tavilySearch(query) {
   }
 }
 
-async function generateIdeas({ count, focus, format, audience, profile, userName }) {
-  const spec = profile?.specialization || '🦷 Терапия, 🪥 Гигиена';
-  const voiceInfo = profile ? `
+// Грубая оценка цены по прайсу claude-sonnet-4-6 ($3/$15 за 1M токенов) —
+// если модель другая, цифра будет неточной, но порядок величины виден.
+function logUsage(label, usage) {
+  if (!usage) return;
+  const inTok = usage.input_tokens || 0;
+  const outTok = usage.output_tokens || 0;
+  const cost = (inTok / 1e6) * 3 + (outTok / 1e6) * 15;
+  console.log(`[usage] ${label}: in=${inTok} out=${outTok} ~$${cost.toFixed(4)}`);
+}
+
+// Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```) или
+// добавляет пояснения до/после, несмотря на просьбу так не делать. Вместо того
+// чтобы гадать про конкретный формат обёртки — просто вырезаем подстроку
+// между первой и последней открывающей/закрывающей скобкой нужного типа.
+function extractJsonArray(raw) {
+  const start = raw.indexOf('[');
+  const end = raw.lastIndexOf(']');
+  if (start === -1 || end === -1 || end < start) return raw.trim();
+  return raw.slice(start, end + 1);
+}
+
+function extractJsonObject(raw) {
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1 || end === -1 || end < start) return raw.trim();
+  return raw.slice(start, end + 1);
+}
+
+function buildVoiceInfo(profile) {
+  return profile ? `
 Голос врача:
 - Как говорит: ${profile.voice || 'не указано'}
 - Чего избегает: ${profile.avoid || 'не указано'}
 - Что заходит у аудитории: ${profile.works || 'не указано'}
 - Не делает в кадре: ${profile.notOnCamera || 'не указано'}` : '';
+}
 
+// Notion rich_text/title — массив кусков текста, склеиваем в одну строку.
+function plainText(richTextArray) {
+  return (richTextArray || []).map(t => t.plain_text).join('');
+}
+
+function chunkText(text, size) {
+  const chunks = [];
+  for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size));
+  return chunks.length ? chunks : [''];
+}
+
+async function generateIdeas({ count, focus, format, audience, profile, userName }) {
+  const spec = profile?.specialization || '🦷 Терапия, 🪥 Гигиена';
+  const voiceInfo = buildVoiceInfo(profile);
   const currentYear = new Date().getFullYear();
 
   const prompt = `Ты — крео-директор, который 5 лет ведёт контент топовых стоматологов в СНГ (клиенты
@@ -211,6 +253,13 @@ ${audience ? `ЦЕЛЕВОЙ СЕГМЕНТ: все идеи должны бит
 ЗАДАЧА: Придумай ровно ${count} идей, которые ты бы поставил в свой личный
 портфолио, а не идей "для галочки".
 
+ГЛАВНЫЙ САМОПРОВЕРОЧНЫЙ ВОПРОС — задавай его к КАЖДОЙ идее перед тем как
+включить её в финальный список: "Я бы реально сегодня взял камеру и
+захотел снять именно это?" Если ответ "ну, наверное, сойдёт" — это НЕТ.
+Идея должна вызывать конкретное желание снимать прямо сейчас, а не быть
+приемлемой заглушкой. Если идея не проходит этот вопрос — выброси её и
+придумай другую, не включай в ответ.
+
 ОБЯЗАТЕЛЬНЫЕ ШАГИ ПЕРЕД ГЕНЕРАЦИЕЙ:
 1. web_search: реальные вопросы пациентов на форумах/в комментариях
    ("${spec} вопросы пациентов форум ${currentYear} ${currentYear - 1}")
@@ -227,13 +276,18 @@ ${audience ? `ЦЕЛЕВОЙ СЕГМЕНТ: все идеи должны бит
 вот примеры того, как это звучит (это ЭТАЛОН ТОНА, не копируй буквально):
 - Разрыв ожидания: "Ты купил ирригатор — молодец. Но если ты выбросил зубную
   нить, у меня плохие новости."
-- Неудобная правда: называет то, что пациент не хочет слышать, без назидания
-  и без "к сожалению вынужден сообщить"
-- Инсайдерский секрет: "То, что я вижу на приёме каждый день, но обычно
-  не говорю вслух"
-- Паттерн-брейк цифрой: конкретное число, которое ломает ожидание
-  ("90% людей делают X не так")
-- Личная ставка: врач от первого лица признаёт, что сам когда-то ошибался
+- Неудобная правда: "Если у тебя когда-то был скол на переднем зубе и тебе
+  поставили пломбу — она потемнеет раньше, чем ты думаешь. Это не брак
+  врача. Это физика материала."
+- Инсайдерский секрет: "На приёме я вижу одно и то же почти каждый день:
+  люди чистят зубы щёткой средней жёсткости, потому что 'она средняя —
+  значит безопасная'. Это не так."
+- Паттерн-брейк цифрой: "80% людей держат зубную щётку под углом, который
+  не убирает налёт у линии дёсен. Не потому что чистят мало — а потому что
+  чистят не туда."
+- Личная ставка: "Пять лет назад я сам не пользовался ирригатором. Думал —
+  маркетинговая штука. Сейчас настоятельно рекомендую его пациентам, и вот
+  почему я был неправ."
 
 Хук должен нести не просто цепляющую фразу, а обещание дуги: зацепка →
 нерешённое напряжение → намёк на разрешение. Зритель должен физически
@@ -312,27 +366,6 @@ aversion), угроза идентичности "я думал что дела�
   "why": "конкретный психологический триггер + на какой сегмент аудитории бьёт"
 }]`;
 
-  // Грубая оценка цены по прайсу claude-sonnet-4-6 ($3/$15 за 1M токенов) —
-  // если модель другая, цифра будет неточной, но порядок величины виден.
-  function logUsage(label, usage) {
-    if (!usage) return;
-    const inTok = usage.input_tokens || 0;
-    const outTok = usage.output_tokens || 0;
-    const cost = (inTok / 1e6) * 3 + (outTok / 1e6) * 15;
-    console.log(`[usage] ${label}: in=${inTok} out=${outTok} ~$${cost.toFixed(4)}`);
-  }
-
-  // Claude иногда оборачивает JSON в markdown-код-блок (```json ... ```) или
-  // добавляет пояснения до/после массива, несмотря на просьбу так не делать.
-  // Вместо того чтобы гадать про конкретный формат обёртки — просто вырезаем
-  // подстроку от первой "[" до последней "]" включительно.
-  function extractJsonArray(raw) {
-    const start = raw.indexOf('[');
-    const end = raw.lastIndexOf(']');
-    if (start === -1 || end === -1 || end < start) return raw.trim();
-    return raw.slice(start, end + 1);
-  }
-
   const MAX_TOOL_ROUNDS = 2; // ограничиваем расходы на web_search — каждый раунд пересылает всю историю заново
 
   let messages = [{ role: 'user', content: prompt }];
@@ -401,6 +434,122 @@ aversion), угроза идентичности "я думал что дела�
   }
 }
 
+// Пишет сценарий уже одобренной идеи (статус "✅ В работу") в двух стилях подачи.
+// Сначала черновик, потом отдельный проход самокритики по чек-листу — модель
+// перечитывает свой же текст и переписывает всё, что не проходит проверку,
+// вместо того чтобы просто "стараться лучше" за один присест.
+async function generateScripts(idea, profile) {
+  const voiceInfo = buildVoiceInfo(profile);
+
+  const draftPrompt = `Ты — тот же крео-директор, который придумал эту идею. Теперь напиши
+РЕАЛЬНЫЙ сценарий, готовый к съёмке сегодня — точный текст, который врач
+произнесёт на камеру слово в слово, а не тезисы и не план.
+
+ИДЕЯ:
+Тема: ${idea.topic}
+Формат: ${idea.format}
+Хук (уже готов, начни ровно с него, не переписывай): "${idea.hook}"
+Почему заходит: ${idea.why}
+
+ПРОФИЛЬ ВРАЧА:
+Имя: ${profile?.name || ''}
+Специализация: ${profile?.specialization || ''}${voiceInfo}
+
+ЗАДАЧА: Напиши сценарий этой идеи в ДВУХ разных стилях подачи:
+1. "🗣️ Разговорный" — врач говорит как в живой беседе с пациентом, простым
+   языком, можно с лёгким юмором
+2. "🎓 Экспертный" — врач говорит увереннее и структурнее, с позиции
+   авторитета, но всё ещё по-человечески, не сухим языком methodички
+
+ТРЕБОВАНИЯ:
+- Хронометраж по формату: "🎬 Reels 30 сек" ≈ 60-80 слов, "🎬 Reels 60 сек"
+  ≈ 140-170 слов, "📝 Пост"/"🎠 Карусель"/"🔬 Научная ветка" — по смыслу, без
+  ограничения по словам, но без воды
+- Начни ровно с хука выше, дальше развивай конкретными фактами/механизмами,
+  не общими словами
+- Заверши чётким выводом, который звучит естественно, не как реклама
+
+ЗАПРЕЩЕНО (те же клише что и в хуках):
+- "Смотрите/дочитайте до конца" и любые команды зрителю остаться
+- "Это не про зубы, это про..." и вариации "это не про X, это про Y"
+- Рубленые предложения-обрывки подряд для псевдонапряжения
+- Риторические вопросы-приманки в начале ("А вы знали, что...")
+- Общие советы без цифр/механизма
+
+Верни ТОЛЬКО валидный JSON без markdown:
+{"styles": [
+  {"name": "🗣️ Разговорный", "text": "полный текст сценария"},
+  {"name": "🎓 Экспертный", "text": "полный текст сценария"}
+]}`;
+
+  const draftResp = await withTimeout(
+    anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages: [{ role: 'user', content: draftPrompt }] }),
+    60000, 'Anthropic script draft',
+  );
+  logUsage('script draft', draftResp.usage);
+  const draftText = draftResp.content.find(b => b.type === 'text')?.text || '{}';
+  let draft;
+  try {
+    draft = JSON.parse(extractJsonObject(draftText));
+  } catch (e) {
+    console.error('[generateScripts] draft JSON parse error:', e.message, '| raw:', draftText.slice(0, 300));
+    throw e;
+  }
+
+  const critiquePrompt = `Вот черновик сценария, который ты только что написал для этой идеи:
+${JSON.stringify(draft)}
+
+Теперь критически проверь КАЖДЫЙ стиль по чек-листу:
+1. Есть хоть одно клише из бан-листа (рубленые фразы-обрывки, "смотрите до
+   конца", "это не про X это про Y", риторический вопрос-приманка, общие
+   советы без цифр/механизма)?
+2. Звучит ли это как живая речь конкретного врача, а не как войсовер или
+   методичка?
+3. Хронометраж соответствует формату "${idea.format}"?
+4. Есть в тексте конкретный факт/механизм, а не только эмоция?
+
+Перепиши всё, что не проходит проверку. Если стиль уже хорош — оставь как
+есть, не порти правками ради правок.
+
+Верни ТОЛЬКО финальный валидный JSON того же формата, без markdown:
+{"styles": [{"name": "...", "text": "..."}, {"name": "...", "text": "..."}]}`;
+
+  const critiqueResp = await withTimeout(
+    anthropic.messages.create({ model: CLAUDE_MODEL, max_tokens: 4000, messages: [{ role: 'user', content: critiquePrompt }] }),
+    60000, 'Anthropic script critique',
+  );
+  logUsage('script critique', critiqueResp.usage);
+  const critiqueText = critiqueResp.content.find(b => b.type === 'text')?.text || '{}';
+  try {
+    const final = JSON.parse(extractJsonObject(critiqueText));
+    return final.styles || draft.styles || [];
+  } catch (e) {
+    console.error('[generateScripts] critique JSON parse error, использую черновик:', e.message);
+    return draft.styles || [];
+  }
+}
+
+// Дописывает сценарии в конец страницы идеи в Notion — каждый стиль своим
+// заголовком, текст режется на куски по лимиту rich_text (2000 символов у Notion).
+async function saveScriptsToPage(pageId, styles) {
+  const children = [];
+  for (const style of styles) {
+    children.push({
+      object: 'block',
+      type: 'heading_2',
+      heading_2: { rich_text: [{ type: 'text', text: { content: `Сценарий — ${style.name || ''}` } }] },
+    });
+    for (const chunk of chunkText(style.text || '', 1900)) {
+      children.push({
+        object: 'block',
+        type: 'paragraph',
+        paragraph: { rich_text: [{ type: 'text', text: { content: chunk } }] },
+      });
+    }
+  }
+  await withTimeout(notion.blocks.children.append({ block_id: pageId, children }), 20000, 'Notion saveScriptsToPage');
+}
+
 // ── Messaging helpers ─────────────────────────────────────────────────────────
 
 // Пытается отредактировать/отправить ответ на интеракцию; если это по какой-то
@@ -459,6 +608,10 @@ const commands = [
           { name: 'Проактивный', value: 'проактивный ("хочу быть лучшей версией себя")' },
           { name: 'Скептик', value: 'скептик ("врачи разводят на деньги")' },
         ))
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('develop')
+    .setDescription('Написать сценарии для идей в статусе "✅ В работу"')
     .toJSON(),
 ];
 
@@ -520,6 +673,53 @@ client.on('interactionCreate', async (interaction) => {
       await safeRespond(interaction, {
         content: `Готово! 📋 [Открыть все идеи в Notion](${notionUrl})`,
         embeds: [embed],
+      });
+      return;
+    }
+
+    // ── /develop ────────────────────────────────────────────────────────────
+    if (interaction.isChatInputCommand() && interaction.commandName === 'develop') {
+      await interaction.deferReply();
+      await interaction.editReply('⏳ Ищу идеи в статусе "✅ В работу"...');
+      console.log('[/develop] старт');
+
+      const res = await withTimeout(notion.databases.query({
+        database_id: process.env.NOTION_IDEAS_DB_ID,
+        filter: { property: 'Статус', select: { equals: '✅ В работу' } },
+      }), 20000, 'Notion develop query');
+
+      if (res.results.length === 0) {
+        await safeRespond(interaction, { content: 'Нет идей в статусе "✅ В работу".' });
+        return;
+      }
+
+      const profile = await getDoctorProfile();
+      let done = 0;
+      for (const page of res.results) {
+        const props = page.properties;
+        const idea = {
+          topic: plainText(props['Тема']?.title),
+          format: props['Формат']?.select?.name || '',
+          hook: plainText(props['Хук']?.rich_text),
+          why: plainText(props['Почему зайдёт']?.rich_text),
+        };
+        try {
+          await interaction.editReply(`⏳ Пишу сценарий ${done + 1}/${res.results.length}: «${idea.topic.slice(0, 60)}»...`);
+          const styles = await generateScripts(idea, profile);
+          await saveScriptsToPage(page.id, styles);
+          await withTimeout(
+            notion.pages.update({ page_id: page.id, properties: { 'Статус': { select: { name: '🎬 В конвейере' } } } }),
+            20000, 'Notion develop status update',
+          );
+          done++;
+          console.log(`[/develop] сценарий готов: ${page.id}`);
+        } catch (e) {
+          console.error('[/develop] ошибка на идее', page.id, e.message);
+        }
+      }
+
+      await safeRespond(interaction, {
+        content: `Готово! ✍️ Сценарии написаны для ${done}/${res.results.length} идей. Статус изменён на "🎬 В конвейере".`,
       });
       return;
     }
