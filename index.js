@@ -7,6 +7,13 @@ const {
   Routes,
   SlashCommandBuilder,
   EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  PermissionFlagsBits,
 } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk');
 const { Client: NotionClient } = require('@notionhq/client');
@@ -617,7 +624,66 @@ const commands = [
     .setName('develop')
     .setDescription('Написать сценарии для идей в статусе "✅ В работу"')
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName('panel')
+    .setDescription('Опубликовать и закрепить панель с кнопками запуска бота в этом канале')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .toJSON(),
 ];
+
+// ── Панель с кнопками запуска ────────────────────────────────────────────────
+
+function buildLauncherRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('launch_ideas')
+      .setLabel('💡 Сгенерировать идеи')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('launch_develop')
+      .setLabel('✍️ Написать сценарии')
+      .setStyle(ButtonStyle.Secondary),
+  );
+}
+
+function buildIdeasModal() {
+  return new ModalBuilder()
+    .setCustomId('ideas_modal')
+    .setTitle('Сгенерировать идеи')
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('count')
+          .setLabel('Сколько идей (1-10)')
+          .setStyle(TextInputStyle.Short)
+          .setValue('5')
+          .setRequired(true),
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('focus')
+          .setLabel('Фокус недели (необязательно)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false),
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('format')
+          .setLabel('Формат (необязательно)')
+          .setPlaceholder('🎬 Reels 30 сек / 🎬 Reels 60 сек / 🎠 Карусель / 📝 Пост / 🔬 Научная ветка')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false),
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+          .setCustomId('audience')
+          .setLabel('Аудитория (необязательно, по умолч. проактивный)')
+          .setPlaceholder('тревожный / проактивный / скептик / mixed')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false),
+      ),
+    );
+}
 
 async function registerCommands() {
   const rest = new REST().setToken(process.env.DISCORD_BOT_TOKEN);
@@ -646,6 +712,88 @@ function ideasToEmbed(ideas, displayName) {
   return embed;
 }
 
+// Каноническая форма для короткого ввода аудитории (из /ideas и из модалки).
+function normalizeAudience(raw) {
+  if (raw === null || raw === undefined) return 'проактивный ("хочу быть лучшей версией себя")';
+  const v = raw.trim().toLowerCase();
+  if (v === '' ) return 'проактивный ("хочу быть лучшей версией себя")';
+  if (v === 'mixed' || v.startsWith('смеш')) return '';
+  if (v.startsWith('тревож')) return 'тревожный пациент ("боюсь, что что-то не так")';
+  if (v.startsWith('проактив')) return 'проактивный ("хочу быть лучшей версией себя")';
+  if (v.startsWith('скептик')) return 'скептик ("врачи разводят на деньги")';
+  return raw.trim();
+}
+
+// ── Общая логика /ideas — используется и слэш-командой, и кнопкой+модалкой ──
+async function runIdeasGeneration(interaction, { count, focus, format, audience, userName }) {
+  await interaction.editReply(`⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...`);
+  console.log(`[ideas] старт: user=${userName} count=${count} focus="${focus}" format="${format}" audience="${audience}"`);
+
+  const profile = await getDoctorProfile();
+  console.log('[ideas] профиль получен');
+  const ideas = await generateIdeas({ count, focus, format, audience, profile, userName });
+  console.log(`[ideas] сгенерировано идей: ${ideas.length}`);
+
+  for (const idea of ideas) {
+    try { await saveIdea(idea, profile.name); }
+    catch (e) { console.error('Notion saveIdea error:', e.message); }
+  }
+  console.log('[ideas] идеи сохранены в Notion');
+
+  const notionUrl = await getIdeasDbUrl();
+  const embed = ideasToEmbed(ideas, profile.name);
+
+  await safeRespond(interaction, {
+    content: `Готово! 📋 [Открыть все идеи в Notion](${notionUrl})`,
+    embeds: [embed],
+  });
+}
+
+// ── Общая логика /develop — используется и слэш-командой, и кнопкой ────────
+async function runDevelop(interaction) {
+  await interaction.editReply('⏳ Ищу идеи в статусе "✅ В работу"...');
+  console.log('[develop] старт');
+
+  const res = await withTimeout(notion.databases.query({
+    database_id: process.env.NOTION_IDEAS_DB_ID,
+    filter: { property: 'Статус', select: { equals: '✅ В работу' } },
+  }), 20000, 'Notion develop query');
+
+  if (res.results.length === 0) {
+    await safeRespond(interaction, { content: 'Нет идей в статусе "✅ В работу".' });
+    return;
+  }
+
+  const profile = await getDoctorProfile();
+  let done = 0;
+  for (const page of res.results) {
+    const props = page.properties;
+    const idea = {
+      topic: plainText(props['Тема']?.title),
+      format: props['Формат']?.select?.name || '',
+      hook: plainText(props['Хук']?.rich_text),
+      why: plainText(props['Почему зайдёт']?.rich_text),
+    };
+    try {
+      await interaction.editReply(`⏳ Пишу сценарий ${done + 1}/${res.results.length}: «${idea.topic.slice(0, 60)}»...`);
+      const styles = await generateScripts(idea, profile);
+      await saveScriptsToPage(page.id, styles);
+      await withTimeout(
+        notion.pages.update({ page_id: page.id, properties: { 'Статус': { select: { name: '🎬 В конвейере' } } } }),
+        20000, 'Notion develop status update',
+      );
+      done++;
+      console.log(`[develop] сценарий готов: ${page.id}`);
+    } catch (e) {
+      console.error('[develop] ошибка на идее', page.id, e.message);
+    }
+  }
+
+  await safeRespond(interaction, {
+    content: `Готово! ✍️ Сценарии написаны для ${done}/${res.results.length} идей. Статус изменён на "🎬 В конвейере".`,
+  });
+}
+
 client.on('interactionCreate', async (interaction) => {
   try {
     // ── /ideas ──────────────────────────────────────────────────────────────
@@ -654,80 +802,61 @@ client.on('interactionCreate', async (interaction) => {
       const focus = interaction.options.getString('focus') || '';
       const format = interaction.options.getString('format') || '';
       const audienceRaw = interaction.options.getString('audience');
-      const audience = audienceRaw === null
-        ? 'проактивный ("хочу быть лучшей версией себя")'
-        : (audienceRaw === 'mixed' ? '' : audienceRaw);
+      const audience = audienceRaw === 'mixed' ? '' : normalizeAudience(audienceRaw);
       const userName = interaction.user.username;
 
       await interaction.deferReply();
-      await interaction.editReply(`⏳ Генерирую ${count} идей${focus ? ` по теме «${focus}»` : ''}...`);
-      console.log(`[/ideas] старт: user=${userName} count=${count} focus="${focus}" format="${format}" audience="${audience}"`);
-
-      const profile = await getDoctorProfile();
-      console.log('[/ideas] профиль получен');
-      const ideas = await generateIdeas({ count, focus, format, audience, profile, userName });
-      console.log(`[/ideas] сгенерировано идей: ${ideas.length}`);
-
-      for (const idea of ideas) {
-        try { await saveIdea(idea, profile.name); }
-        catch (e) { console.error('Notion saveIdea error:', e.message); }
-      }
-      console.log('[/ideas] идеи сохранены в Notion');
-
-      const notionUrl = await getIdeasDbUrl();
-      const embed = ideasToEmbed(ideas, profile.name);
-
-      await safeRespond(interaction, {
-        content: `Готово! 📋 [Открыть все идеи в Notion](${notionUrl})`,
-        embeds: [embed],
-      });
+      await runIdeasGeneration(interaction, { count, focus, format, audience, userName });
       return;
     }
 
     // ── /develop ────────────────────────────────────────────────────────────
     if (interaction.isChatInputCommand() && interaction.commandName === 'develop') {
       await interaction.deferReply();
-      await interaction.editReply('⏳ Ищу идеи в статусе "✅ В работу"...');
-      console.log('[/develop] старт');
+      await runDevelop(interaction);
+      return;
+    }
 
-      const res = await withTimeout(notion.databases.query({
-        database_id: process.env.NOTION_IDEAS_DB_ID,
-        filter: { property: 'Статус', select: { equals: '✅ В работу' } },
-      }), 20000, 'Notion develop query');
-
-      if (res.results.length === 0) {
-        await safeRespond(interaction, { content: 'Нет идей в статусе "✅ В работу".' });
-        return;
-      }
-
-      const profile = await getDoctorProfile();
-      let done = 0;
-      for (const page of res.results) {
-        const props = page.properties;
-        const idea = {
-          topic: plainText(props['Тема']?.title),
-          format: props['Формат']?.select?.name || '',
-          hook: plainText(props['Хук']?.rich_text),
-          why: plainText(props['Почему зайдёт']?.rich_text),
-        };
-        try {
-          await interaction.editReply(`⏳ Пишу сценарий ${done + 1}/${res.results.length}: «${idea.topic.slice(0, 60)}»...`);
-          const styles = await generateScripts(idea, profile);
-          await saveScriptsToPage(page.id, styles);
-          await withTimeout(
-            notion.pages.update({ page_id: page.id, properties: { 'Статус': { select: { name: '🎬 В конвейере' } } } }),
-            20000, 'Notion develop status update',
-          );
-          done++;
-          console.log(`[/develop] сценарий готов: ${page.id}`);
-        } catch (e) {
-          console.error('[/develop] ошибка на идее', page.id, e.message);
-        }
-      }
-
-      await safeRespond(interaction, {
-        content: `Готово! ✍️ Сценарии написаны для ${done}/${res.results.length} идей. Статус изменён на "🎬 В конвейере".`,
+    // ── /panel — публикует и закрепляет кнопки запуска в текущем канале ─────
+    if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
+      await interaction.reply({
+        content: '**Запуск бота**\nНажми кнопку, чтобы сгенерировать идеи или написать сценарии — без слэш-команд.',
+        components: [buildLauncherRow()],
       });
+      try {
+        const msg = await interaction.fetchReply();
+        await msg.pin();
+      } catch (e) {
+        console.error('[/panel] не удалось закрепить сообщение:', e.message);
+      }
+      return;
+    }
+
+    // ── Кнопка «Сгенерировать идеи» — открывает форму ────────────────────────
+    if (interaction.isButton() && interaction.customId === 'launch_ideas') {
+      await interaction.showModal(buildIdeasModal());
+      return;
+    }
+
+    // ── Кнопка «Написать сценарии» — запускает /develop сразу ───────────────
+    if (interaction.isButton() && interaction.customId === 'launch_develop') {
+      await interaction.deferReply();
+      await runDevelop(interaction);
+      return;
+    }
+
+    // ── Сабмит формы генерации идей ──────────────────────────────────────────
+    if (interaction.isModalSubmit() && interaction.customId === 'ideas_modal') {
+      const countRaw = parseInt(interaction.fields.getTextInputValue('count'), 10);
+      const count = Number.isFinite(countRaw) ? Math.min(10, Math.max(1, countRaw)) : 5;
+      const focus = interaction.fields.getTextInputValue('focus') || '';
+      const format = interaction.fields.getTextInputValue('format') || '';
+      const audienceRaw = interaction.fields.getTextInputValue('audience');
+      const audience = normalizeAudience(audienceRaw);
+      const userName = interaction.user.username;
+
+      await interaction.deferReply();
+      await runIdeasGeneration(interaction, { count, focus, format, audience, userName });
       return;
     }
   } catch (err) {
